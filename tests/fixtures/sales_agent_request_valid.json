@@ -1,0 +1,8 @@
+{
+  "tenantId": "default",
+  "message": "지난달 특정 상품 구매 고객을 조회해줘",
+  "execution": {
+    "allowExecute": false,
+    "allowPii": false
+  }
+}

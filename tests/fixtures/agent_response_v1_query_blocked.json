@@ -1,0 +1,5 @@
+{
+  "requestId": "REQ-V1-BLOCKED",
+  "status": "FAILED",
+  "issues": [{"code": "QUERY_BLOCKED", "severity": "BLOCKING", "message": "조회 조건 검증 실패"}]
+}

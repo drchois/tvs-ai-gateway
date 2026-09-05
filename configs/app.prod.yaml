@@ -1,0 +1,9 @@
+app:
+  env: prod
+
+profiles:
+  active: prod
+
+logging:
+  level: INFO
+  json: true

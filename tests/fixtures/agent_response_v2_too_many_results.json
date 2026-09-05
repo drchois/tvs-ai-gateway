@@ -1,0 +1,22 @@
+{
+  "requestId": "REQ-V2-TOO-MANY",
+  "status": "BLOCKED",
+  "responseSchemaVersion": "2.0",
+  "message": "요청 결과가 현재 조회 제한 100건을 초과합니다. 기간을 줄이거나 특정 상품을 지정해 주세요.",
+  "issues": [
+    {
+      "code": "TOO_MANY_RESULTS",
+      "severity": "BLOCKING",
+      "message": "조회 결과가 허용 한도를 초과했습니다."
+    }
+  ],
+  "refinement": {
+    "limit": 100,
+    "resultCount": 1842,
+    "countExact": true,
+    "suggestions": [
+      "SPECIFY_PRODUCT",
+      "SHORTEN_PERIOD"
+    ]
+  }
+}

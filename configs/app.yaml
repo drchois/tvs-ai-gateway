@@ -1,0 +1,59 @@
+app:
+  name: tvs-ai-gateway
+  env: dev
+  host: 0.0.0.0
+  port: 8000
+  docs_url: /docs
+  openapi_url: /openapi.json
+
+profiles:
+  active: dev
+
+sales_agent:
+  enabled: false
+  base_url: http://127.0.0.1:7071
+  request_path: /api/assistant/message
+  health_path: /api/admin/dashboard
+  execute_path: /api/v1/agent/requests/{requestId}/execute
+  status_path: /api/v1/agent/requests/{requestId}
+  default_tenant: default
+
+minio:
+  enabled: false
+  endpoint: http://127.0.0.1:9000
+  bucket_exports: tvs-agent-exports
+
+request_projection:
+  enabled: true
+  database_url: sqlite:///./data/user_request_projection.db
+  preview_row_limit: 100
+
+security:
+  enabled: true
+  protected_prefixes:
+    - /api/assistant
+    - /api/requests
+    - /api/artifacts
+  exempt_paths:
+    - /docs
+    - /openapi.json
+    - /redoc
+    - /health
+    - /health/agent
+    - /api/health/
+  api_keys: []
+  header_name: X-API-Key
+
+cors:
+  enabled: true
+  allow_origins:
+    - https://tvsales.bizflow.it.kr
+    - http://tvsales.bizflow.it.kr
+  allow_methods: ["*"]
+  allow_headers: ["*"]
+  expose_headers: [X-Request-Id]
+  allow_credentials: true
+
+logging:
+  level: INFO
+  json: true

@@ -1,0 +1,10 @@
+{
+  "requestId": "REQ-V1-COMPLETED",
+  "status": "COMPLETED",
+  "message": "완료",
+  "result": {
+    "columns": ["custom.second", "custom.first"],
+    "rows": [{"custom.second": 2, "custom.first": 1}],
+    "rowCount": 1
+  }
+}

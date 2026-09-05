@@ -1,0 +1,33 @@
+services:
+
+  tvs-ai-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    image: tvs-ai-gateway:latest
+    container_name: tvs-ai-gateway
+
+    restart: unless-stopped
+
+    ports:
+      - "7072:7072"
+
+    env_file:
+      - .env
+
+    environment:
+      TZ: Asia/Seoul
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:7072/health')"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

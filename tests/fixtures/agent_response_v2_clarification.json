@@ -1,0 +1,7 @@
+{
+  "requestId": "REQ-V2-CLARIFY",
+  "status": "REQUIRES_CLARIFICATION",
+  "responseSchemaVersion": "2.0",
+  "reasonCode": "BUSINESS_DEFINITION_AMBIGUOUS",
+  "questions": [{"questionId": "q-1", "text": "조회 기준을 선택해 주세요."}]
+}

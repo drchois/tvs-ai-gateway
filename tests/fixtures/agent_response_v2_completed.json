@@ -1,0 +1,33 @@
+{
+  "requestId": "REQ-V2-COMPLETED",
+  "status": "COMPLETED",
+  "responseSchemaVersion": "2.0",
+  "message": "조회가 완료되었습니다.",
+  "result": {
+    "profileId": "sales.customer-list",
+    "resultMode": "DETAIL",
+    "summary": {"items": []},
+    "columns": [
+      {"key": "product.productName", "label": "상품명", "dataType": "STRING"},
+      {"key": "sales.quantity", "label": "판매수량", "dataType": "INTEGER"}
+    ],
+    "rows": [
+      {"product.productName": "B.A크림50ML", "sales.quantity": 2}
+    ],
+    "rowCount": 1,
+    "truncated": false,
+    "deduplicationApplied": false,
+    "definitions": [],
+    "download": {
+      "available": true,
+      "downloadId": "DL-V2-COMPLETED",
+      "format": "XLSX",
+      "title": "판매 결과",
+      "status": "READY",
+      "expiresAt": "2026-09-10T20:00:00+09:00",
+      "storageType": "MINIO",
+      "bucketName": "tvs-agent-exports",
+      "objectKey": "dev/default/agent-results/2026/09/REQ-V2-COMPLETED/DL-V2-COMPLETED.xlsx"
+    }
+  }
+}
