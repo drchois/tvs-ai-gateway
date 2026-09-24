@@ -22,7 +22,7 @@ from app.services.agent_response_adapter import (
     normalize_agent_response,
 )
 from app.services.assistant_intent_router import classify_business_intent
-from app.services.clarification_service import resolve_relative_period
+from app.services.clarification_service import merge_query_spec, resolve_relative_period
 from app.services.sales_agent_service import (
     HttpSalesAgentClient,
     SalesAgentError,
@@ -132,6 +132,44 @@ class ClarificationServiceTests(unittest.TestCase):
         for message, reference in expected.items():
             with self.subTest(message=message):
                 self.assertEqual(resolve_relative_period(message, now=now)["reference"], reference)
+
+    def test_new_customer_resolution_preserves_existing_query_spec(self) -> None:
+        original = {
+            "target": {"entity": "customer", "scope": "new_customer"},
+            "periods": {"analysis": {
+                "from": "2026-09-25", "to": "2026-09-25", "status": "RESOLVED",
+            }},
+            "segments": [{
+                "segmentId": "NEW-CUSTOMERS",
+                "name": "신규고객",
+                "conceptRef": "UNRESOLVED_NEW_CUSTOMER_CONCEPT",
+            }],
+            "ambiguities": [{
+                "ambiguityId": "AMB-DET-001", "status": "OPEN", "blocking": True,
+                "clarificationRequired": True,
+            }],
+            "output": {"format": "XLSX"},
+            "security": {"allowPii": False},
+            "tenant": {"id": "tenant-a"},
+            "queryExecutable": False,
+        }
+
+        resolved = merge_query_spec(original, {
+            "ambiguityId": "AMB-DET-001",
+            "field": "newCustomerType",
+            "value": "JOIN_NEW_CUSTOMER",
+            "label": "회원 신규 가입 고객",
+        })
+
+        self.assertEqual(original["segments"][0]["conceptRef"], "UNRESOLVED_NEW_CUSTOMER_CONCEPT")
+        self.assertEqual(resolved["segments"][0]["conceptRef"], "JOIN_NEW_CUSTOMER")
+        self.assertEqual(resolved["segments"][0]["name"], "회원 신규 가입 고객")
+        self.assertEqual(resolved["ambiguities"], [])
+        self.assertEqual(resolved["resolvedAmbiguities"][0]["status"], "RESOLVED")
+        self.assertTrue(resolved["queryExecutable"])
+        self.assertEqual(resolved["output"], original["output"])
+        self.assertEqual(resolved["security"], original["security"])
+        self.assertEqual(resolved["tenant"], original["tenant"])
 
 
 class AgentResponseAdapterTests(unittest.TestCase):
@@ -1129,6 +1167,26 @@ class SalesAgentClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "COMPLETED")
         self.assertEqual(calls, 1)
 
+    async def test_execute_forwards_clarification_resolution_payload(self) -> None:
+        expected = {
+            "clarification": {
+                "ambiguityId": "AMB-DET-001",
+                "selectedOption": "JOIN_NEW_CUSTOMER",
+            },
+            "querySpec": {"queryExecutable": True},
+        }
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(json.loads(request.content), expected)
+            self.assertEqual(request.headers["X-Agent-Caller"], "fastapi")
+            return httpx.Response(200, json={"requestId": "agent-123", "status": "COMPLETED"})
+
+        client = HttpSalesAgentClient(SalesAgentConfig(enabled=True), transport=httpx.MockTransport(handler))
+        result = await client.execute_request(
+            agent_request_id="agent-123", request_id="gateway-1", payload=expected
+        )
+        self.assertEqual(result["status"], "COMPLETED")
+
     async def test_execute_timeout_is_not_retried(self) -> None:
         calls = 0
         async def handler(request: httpx.Request) -> httpx.Response:
@@ -1505,6 +1563,7 @@ class PendingClarificationE2ETests(unittest.TestCase):
         def __init__(self) -> None:
             self.submitted_messages: list[str] = []
             self.executed_request_ids: list[str] = []
+            self.execute_payloads: list[dict] = []
             self.sequence = 0
 
         async def submit_request(self, request, *, request_id: str, session_id: str):
@@ -1547,8 +1606,9 @@ class PendingClarificationE2ETests(unittest.TestCase):
                 }
             return self._completed(f"REQ-DIRECT-{self.sequence}")
 
-        async def execute_request(self, *, agent_request_id: str, request_id: str):
+        async def execute_request(self, *, agent_request_id: str, request_id: str, payload=None):
             self.executed_request_ids.append(agent_request_id)
+            self.execute_payloads.append(payload or {})
             return self._completed(agent_request_id)
 
         @staticmethod
@@ -1592,10 +1652,12 @@ class PendingClarificationE2ETests(unittest.TestCase):
         self.service.engine.dispose()
         self.temp_directory.cleanup()
 
-    def post(self, session_id: str, message: str, clarification: dict | None = None):
+    def post(self, session_id: str, message: str, clarification: dict | None = None, request_id: str | None = None):
         body = {"sessionId": session_id, "message": message}
         if clarification:
             body["clarification"] = clarification
+        if request_id:
+            body["requestId"] = request_id
         return self.client.post("/api/assistant/message", headers=self.headers, json=body)
 
     def test_01_member_signup_answer_restores_pending_and_executes(self) -> None:
@@ -1606,16 +1668,36 @@ class PendingClarificationE2ETests(unittest.TestCase):
 
         second = self.post("session-member", "회원 신규 가입 고객")
         self.assertEqual(second.json()["status"], "COMPLETED")
-        self.assertIn("오늘 신규 고객을 조회해", self.mock.submitted_messages[-1])
-        self.assertIn("newCustomerType=MEMBER_SIGNUP", self.mock.submitted_messages[-1])
         self.assertEqual(len(self.mock.executed_request_ids), 1)
+        self.assertEqual(self.mock.executed_request_ids[0], first.json()["requestId"])
+        payload = self.mock.execute_payloads[0]
+        self.assertEqual(payload["clarification"], {
+            "ambiguityId": "AMB-DET-001", "selectedOption": "JOIN_NEW_CUSTOMER",
+        })
+        self.assertTrue(payload["querySpec"]["queryExecutable"])
+        self.assertEqual(payload["querySpec"]["segments"][0]["conceptRef"], "JOIN_NEW_CUSTOMER")
+        self.assertEqual(payload["querySpec"]["ambiguities"], [])
+        with self.service.engine.connect() as connection:
+            stored = connection.execute(text(
+                "SELECT status, clarification_json FROM pending_clarification_request "
+                "WHERE request_id = :request_id"
+            ), {"request_id": first.json()["requestId"]}).mappings().one()
+        resolution = json.loads(stored["clarification_json"])["_resolution"]
+        self.assertEqual(stored["status"], "COMPLETED")
+        self.assertEqual(resolution["selectedOption"], "JOIN_NEW_CUSTOMER")
+        self.assertEqual(resolution["statusHistory"], [
+            "CLARIFICATION_RESOLVED", "READY_TO_EXECUTE", "EXECUTING", "COMPLETED",
+        ])
 
     def test_02_first_purchase_natural_answer_is_mapped(self) -> None:
         self.post("session-first-purchase", "오늘 신규 고객을 조회해")
         response = self.post("session-first-purchase", "전체 최초 구매 고객")
 
         self.assertEqual(response.json()["status"], "COMPLETED")
-        self.assertIn("newCustomerType=FIRST_PURCHASE", self.mock.submitted_messages[-1])
+        self.assertEqual(
+            self.mock.execute_payloads[-1]["clarification"]["selectedOption"],
+            "FIRST_PURCHASE_CUSTOMER",
+        )
 
     def test_03_product_context_is_kept_when_period_is_answered(self) -> None:
         first = self.post("session-product", "B.A크림 판매데이터")
@@ -1623,8 +1705,9 @@ class PendingClarificationE2ETests(unittest.TestCase):
         response = self.post("session-product", "오늘")
 
         self.assertEqual(response.json()["status"], "COMPLETED")
-        self.assertIn("B.A크림 판매데이터", self.mock.submitted_messages[-1])
-        self.assertIn("period=TODAY", self.mock.submitted_messages[-1])
+        query_spec = self.mock.execute_payloads[-1]["querySpec"]
+        self.assertEqual(query_spec["target"]["entity"], "product")
+        self.assertEqual(query_spec["periods"]["analysis"]["reference"], "TODAY")
 
     def test_04_this_month_period_survives_customer_clarification(self) -> None:
         self.post("session-month", "이번달 신규 고객")
@@ -1638,10 +1721,14 @@ class PendingClarificationE2ETests(unittest.TestCase):
         response = self.post(
             "session-month",
             "회원 신규 가입 고객",
-            {"field": "newCustomerType", "value": "MEMBER_SIGNUP"},
+            {"ambiguityId": "AMB-DET-001", "selectedOption": "JOIN_NEW_CUSTOMER"},
+            request_id=pending["requestId"],
         )
         self.assertEqual(response.json()["status"], "COMPLETED")
-        self.assertIn("이번달 신규 고객", self.mock.submitted_messages[-1])
+        self.assertEqual(
+            self.mock.execute_payloads[-1]["querySpec"]["periods"]["analysis"]["reference"],
+            "THIS_MONTH",
+        )
 
     def test_05_completed_pending_is_not_applied_to_next_request(self) -> None:
         self.post("session-reset", "오늘 신규 고객을 조회해")
@@ -1650,7 +1737,7 @@ class PendingClarificationE2ETests(unittest.TestCase):
 
         self.assertEqual(response.json()["status"], "COMPLETED")
         self.assertEqual(self.mock.submitted_messages[-1], "오늘 판매현황")
-        self.assertNotIn("추가 조건:", self.mock.submitted_messages[-1])
+        self.assertEqual(len(self.mock.submitted_messages), 2)
 
 
 class TooManyResultsEndpointTests(unittest.TestCase):

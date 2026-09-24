@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from calendar import monthrange
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import re
 from typing import Any
@@ -48,7 +49,14 @@ def resolve_relative_period(message: str, *, now: datetime | None = None) -> dic
 
 
 def _period(reference: str, date_from: object, date_to: object) -> dict[str, str]:
-    return {"reference": reference, "from": str(date_from), "to": str(date_to)}
+    return {
+        "reference": reference,
+        "expression": reference,
+        "from": str(date_from),
+        "to": str(date_to),
+        "status": "RESOLVED",
+        "timezone": "Asia/Seoul",
+    }
 
 
 def build_initial_query_spec(message: str, interpretation: object = None) -> dict[str, Any]:
@@ -60,6 +68,26 @@ def build_initial_query_spec(message: str, interpretation: object = None) -> dic
     period = resolve_relative_period(message)
     if period:
         query_spec.setdefault("periods", {})["analysis"] = period
+    compact = re.sub(r"\s+", "", message or "")
+    if "신규고객" in compact:
+        query_spec.setdefault("intent", {
+            "type": "DATA_EXTRACTION",
+            "requestType": "NEW_CUSTOMER_LIST",
+            "description": message,
+        })
+        query_spec.setdefault("target", {
+            "entity": "customer", "scope": "new_customer", "completeness": "EXPLICIT",
+        })
+        query_spec.setdefault("segments", [{
+            "segmentId": "NEW-CUSTOMERS",
+            "name": "신규고객",
+            "conceptRef": "UNRESOLVED_NEW_CUSTOMER_CONCEPT",
+            "parameters": {},
+        }])
+    elif any(term in compact for term in ("상품", "품목", "제품", "크림")):
+        query_spec.setdefault("target", {
+            "entity": "product", "scope": "sales", "completeness": "EXPLICIT",
+        })
     return query_spec
 
 
@@ -78,7 +106,7 @@ def _normalize_prompt(raw: dict[str, Any], result: dict[str, Any]) -> dict[str, 
     for index, option in enumerate(raw.get("options") or []):
         source = option if isinstance(option, dict) else {"label": str(option), "value": str(option)}
         label = str(source.get("label") or source.get("text") or source.get("value") or f"선택 {index + 1}")
-        value = str(source.get("value") or source.get("code") or source.get("id") or label)
+        value = _canonical_option(str(source.get("value") or source.get("code") or source.get("id") or label))
         options.append({"label": label, "value": value})
     field = str(raw.get("field") or raw.get("key") or raw.get("questionId") or "").strip()
     combined = " ".join(
@@ -90,7 +118,15 @@ def _normalize_prompt(raw: dict[str, Any], result: dict[str, Any]) -> dict[str, 
             field = "newCustomerType"
         elif any(term in combined for term in ("기간", "오늘", "이번달", "지난달")):
             field = "period"
-    return {"field": field or "clarification", "type": str(raw.get("type") or "SINGLE_SELECT"), "options": options}
+    ambiguity_id = str(raw.get("ambiguityId") or raw.get("questionId") or field or "clarification")
+    if field == "newCustomerType" and ambiguity_id in {"new-customer-definition", "newCustomerType"}:
+        ambiguity_id = "AMB-DET-001"
+    return {
+        "ambiguityId": ambiguity_id,
+        "field": field or "clarification",
+        "type": str(raw.get("type") or "SINGLE_SELECT"),
+        "options": options,
+    }
 
 
 def resolve_clarification_answer(
@@ -100,14 +136,18 @@ def resolve_clarification_answer(
 ) -> dict[str, str] | None:
     field = str(prompt.get("field") or "clarification")
     options = [item for item in (prompt.get("options") or []) if isinstance(item, dict)]
+    ambiguity_id = str(prompt.get("ambiguityId") or field)
     if explicit is not None:
-        if explicit.field != field:
+        explicit_id = explicit.ambiguity_id or explicit.field
+        explicit_value = explicit.selected_option or explicit.value
+        if explicit_id not in {ambiguity_id, field}:
             return None
         allowed_values = {str(item.get("value") or "") for item in options}
-        if allowed_values and explicit.value not in allowed_values:
+        canonical_value = _canonical_option(str(explicit_value or ""))
+        if allowed_values and canonical_value not in allowed_values:
             return None
-        label = next((str(item.get("label") or "") for item in options if str(item.get("value")) == explicit.value), message)
-        return {"field": field, "value": explicit.value, "label": label}
+        label = next((str(item.get("label") or "") for item in options if str(item.get("value")) == canonical_value), message)
+        return {"ambiguityId": ambiguity_id, "field": field, "value": canonical_value, "label": label}
 
     normalized = _normalize_text(message)
     for option in options:
@@ -116,41 +156,121 @@ def resolve_clarification_answer(
         if normalized in {_normalize_text(value), _normalize_text(label)} or (
             normalized and _normalize_text(label) and _normalize_text(label) in normalized
         ):
-            return {"field": field, "value": value, "label": label}
+            return {"ambiguityId": ambiguity_id, "field": field, "value": value, "label": label}
 
     aliases = {
-        "MEMBER_SIGNUP": ("회원가입기준으로", "가입한고객", "신규가입자", "회원신규가입고객"),
-        "FIRST_PURCHASE": ("처음구매한고객", "최초구매자", "구매이력이없던고객", "전체최초구매고객"),
+        "JOIN_NEW_CUSTOMER": ("회원가입기준으로", "가입한고객", "신규가입자", "회원신규가입고객"),
+        "FIRST_PURCHASE_CUSTOMER": ("처음구매한고객", "최초구매자", "구매이력이없던고객", "전체최초구매고객"),
     }
     for value, phrases in aliases.items():
         if normalized in phrases or any(phrase in normalized for phrase in phrases):
-            return {"field": field, "value": value, "label": message.strip()}
+            return {"ambiguityId": ambiguity_id, "field": field, "value": value, "label": message.strip()}
 
     period = resolve_relative_period(message)
     if field.lower() in {"period", "date", "analysisperiod"} and period:
-        return {"field": field, "value": period["reference"], "label": message.strip()}
+        return {"ambiguityId": ambiguity_id, "field": field, "value": period["reference"], "label": message.strip()}
     return None
 
 
 def merge_query_spec(query_spec: dict[str, Any], answer: dict[str, str]) -> dict[str, Any]:
-    merged = dict(query_spec)
+    merged = deepcopy(query_spec)
     answers = dict(merged.get("answers") or {})
     answers[answer["field"]] = answer["value"]
     merged["answers"] = answers
+    ambiguity_id = answer.get("ambiguityId") or answer["field"]
+    open_ambiguities = []
+    resolved_ambiguities = list(merged.get("resolvedAmbiguities") or [])
+    matched = False
+    for raw in merged.get("ambiguities") or []:
+        ambiguity = dict(raw) if isinstance(raw, dict) else {}
+        current_id = str(ambiguity.get("ambiguityId") or ambiguity.get("id") or "")
+        if current_id == ambiguity_id:
+            ambiguity.update({
+                "ambiguityId": ambiguity_id,
+                "status": "RESOLVED",
+                "selectedOption": answer["value"],
+                "blocking": False,
+                "clarificationRequired": False,
+            })
+            resolved_ambiguities.append(ambiguity)
+            matched = True
+        else:
+            open_ambiguities.append(ambiguity)
+    if not matched:
+        resolved_ambiguities.append({
+            "ambiguityId": ambiguity_id,
+            "status": "RESOLVED",
+            "selectedOption": answer["value"],
+            "blocking": False,
+            "clarificationRequired": False,
+        })
+    merged["ambiguities"] = open_ambiguities
+    merged["resolvedAmbiguities"] = resolved_ambiguities
+
+    concept_values = {
+        "JOIN_NEW_CUSTOMER",
+        "FIRST_PURCHASE_CUSTOMER",
+        "BRAND_FIRST_PURCHASE_CUSTOMER",
+        "PRODUCT_FIRST_PURCHASE_CUSTOMER",
+    }
+    if answer["value"] in concept_values:
+        for segment in merged.get("segments") or []:
+            if isinstance(segment, dict) and segment.get("conceptRef") == "UNRESOLVED_NEW_CUSTOMER_CONCEPT":
+                segment["conceptRef"] = answer["value"]
+                segment["name"] = answer.get("label") or segment.get("name")
     if answer["field"].lower() in {"period", "date", "analysisperiod"}:
         period = resolve_relative_period(answer.get("label") or "")
         if period:
             periods = dict(merged.get("periods") or {})
             periods["analysis"] = period
             merged["periods"] = periods
+    merged["queryExecutable"] = validate_query_spec(merged)
     return merged
 
 
-def build_merged_message(original_message: str, answer: dict[str, str]) -> str:
-    return (
-        f"{original_message.strip()}\n"
-        f"추가 조건: {answer['label']} ({answer['field']}={answer['value']})"
+def validate_query_spec(query_spec: dict[str, Any]) -> bool:
+    ambiguities = query_spec.get("ambiguities") or []
+    has_open_blocker = any(
+        isinstance(item, dict)
+        and str(item.get("status") or "OPEN").upper() == "OPEN"
+        and bool(item.get("blocking", True))
+        for item in ambiguities
     )
+    analysis = (query_spec.get("periods") or {}).get("analysis") or {}
+    target = query_spec.get("target") or {}
+    segments = query_spec.get("segments") or []
+    unresolved_concept = any(
+        isinstance(item, dict) and str(item.get("conceptRef") or "").startswith("UNRESOLVED_")
+        for item in segments
+    )
+    period_resolved = bool(analysis.get("from") and analysis.get("to")) and str(analysis.get("status") or "RESOLVED") == "RESOLVED"
+    target_resolved = bool(target.get("entity"))
+    return not has_open_blocker and period_resolved and target_resolved and not unresolved_concept
+
+
+def add_pending_ambiguity(query_spec: dict[str, Any], prompt: dict[str, Any]) -> dict[str, Any]:
+    enriched = deepcopy(query_spec)
+    ambiguity_id = str(prompt.get("ambiguityId") or prompt.get("field") or "clarification")
+    ambiguities = [dict(item) for item in enriched.get("ambiguities") or [] if isinstance(item, dict)]
+    if not any(str(item.get("ambiguityId") or item.get("id") or "") == ambiguity_id for item in ambiguities):
+        ambiguities.append({
+            "ambiguityId": ambiguity_id,
+            "status": "OPEN",
+            "blocking": True,
+            "clarificationRequired": True,
+        })
+    enriched["ambiguities"] = ambiguities
+    enriched["queryExecutable"] = False
+    return enriched
+
+
+def _canonical_option(value: str) -> str:
+    return {
+        "MEMBER_SIGNUP": "JOIN_NEW_CUSTOMER",
+        "FIRST_PURCHASE": "FIRST_PURCHASE_CUSTOMER",
+        "BRAND_FIRST": "BRAND_FIRST_PURCHASE_CUSTOMER",
+        "PRODUCT_FIRST": "PRODUCT_FIRST_PURCHASE_CUSTOMER",
+    }.get(value, value)
 
 
 def _normalize_text(value: str) -> str:

@@ -61,7 +61,9 @@ class SalesAgentClient(Protocol):
         self, request: AssistantMessageRequest, *, request_id: str, session_id: str
     ) -> dict[str, Any]: ...
 
-    async def execute_request(self, *, agent_request_id: str, request_id: str) -> dict[str, Any]: ...
+    async def execute_request(
+        self, *, agent_request_id: str, request_id: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]: ...
 
     async def get_request(self, *, agent_request_id: str, request_id: str) -> dict[str, Any]: ...
 
@@ -156,7 +158,9 @@ class HttpSalesAgentClient:
         except httpx.RequestError as exc:
             raise SalesAgentError("Agent에 연결할 수 없습니다.", code="AGENT_CONNECTION_FAILED") from exc
 
-    async def execute_request(self, *, agent_request_id: str, request_id: str) -> dict[str, Any]:
+    async def execute_request(
+        self, *, agent_request_id: str, request_id: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         if not self.config.enabled:
             raise SalesAgentError("판매 데이터 요청 기능이 비활성화되어 있습니다.", code="AGENT_DISABLED", http_status=503)
         safe_id = quote(agent_request_id.strip(), safe="")
@@ -174,7 +178,7 @@ class HttpSalesAgentClient:
         )
         try:
             async with httpx.AsyncClient(timeout=timeout, transport=self.transport) as client:
-                response = await client.post(self._url(path), json={}, headers=self._headers(request_id))
+                response = await client.post(self._url(path), json=payload or {}, headers=self._headers(request_id))
                 response.raise_for_status()
                 result = self._json_object(response)
                 LOG.info("agent.execute.completed", extra={
@@ -270,8 +274,12 @@ class HttpSalesAgentClient:
     ) -> dict[str, Any]:
         return await self.submit_request(request, request_id=request_id, session_id=session_id)
 
-    async def execute(self, *, agent_request_id: str, request_id: str) -> dict[str, Any]:
-        return await self.execute_request(agent_request_id=agent_request_id, request_id=request_id)
+    async def execute(
+        self, *, agent_request_id: str, request_id: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return await self.execute_request(
+            agent_request_id=agent_request_id, request_id=request_id, payload=payload
+        )
 
 
 def get_sales_agent_client() -> SalesAgentClient:

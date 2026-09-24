@@ -19,15 +19,15 @@ from app.schemas.assistant import (
     AssistantMessageRequest,
     AssistantMessageResponse,
     BusinessIntent,
-    SalesAgentExecution,
 )
 from app.services.assistant_intent_router import classify_business_intent, is_tv_sales_intent
 from app.services.clarification_service import (
+    add_pending_ambiguity,
     build_initial_query_spec,
-    build_merged_message,
     extract_clarification,
     merge_query_spec,
     resolve_clarification_answer,
+    validate_query_spec,
 )
 from app.services.agent_response_adapter import (
     UnsupportedAgentSchemaVersion,
@@ -51,6 +51,25 @@ from app.services.sales_agent_service import (
 
 LOG = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/assistant", tags=["assistant"], dependencies=[Security(require_api_key_for_docs)])
+
+
+def _first_concept_ref(query_spec: dict[str, object]) -> str | None:
+    for segment in query_spec.get("segments") or []:
+        if isinstance(segment, dict) and segment.get("conceptRef"):
+            return str(segment["conceptRef"])
+    return None
+
+
+def _open_blocking_count(query_spec: dict[str, object]) -> int:
+    return sum(
+        1
+        for item in query_spec.get("ambiguities") or []
+        if isinstance(item, dict)
+        and str(item.get("status") or "OPEN").upper() == "OPEN"
+        and bool(item.get("blocking", True))
+    )
+
+
 def _normalize_sales_result(result: dict[str, object], *, tenant_id: str) -> dict[str, object]:
     try:
         normalized = normalize_agent_response(result)
@@ -340,6 +359,7 @@ async def assistant_message(
             session_id=session_id,
             tenant_id=tenant_id,
             user_id=user_id,
+            request_id=body.request_id,
         )
         if projection.config.enabled and body.session_id and not is_confirm_action
         else None
@@ -349,6 +369,18 @@ async def assistant_message(
     query_spec_before: dict[str, object] = {}
     query_spec_after: dict[str, object] = {}
     original_message = body.message
+
+    if body.clarification is not None and pending is None:
+        return AssistantMessageResponse(
+            requestId=body.request_id or request_id,
+            sessionId=session_id,
+            intent=BusinessIntent.CUSTOMER_DATA_REQUEST,
+            status="ERROR",
+            message="확인할 기존 요청을 찾을 수 없습니다. 처음 요청부터 다시 진행해주세요.",
+            data={"errorCode": "PENDING_REQUEST_NOT_FOUND"},
+            issues=[],
+            actions=[AssistantAction(type="safe_error", payload={"errorCode": "PENDING_REQUEST_NOT_FOUND"})],
+        )
 
     if pending:
         try:
@@ -387,14 +419,30 @@ async def assistant_message(
         original_message = str(pending.get("originalMessage") or body.message)
         query_spec_before = dict(pending.get("querySpec") or {})
         query_spec_after = merge_query_spec(query_spec_before, pending_answer)
-        agent_body = body.model_copy(update={
-            "tenant_id": tenant_id,
-            "message": build_merged_message(original_message, pending_answer),
-            "execution": SalesAgentExecution(
-                allowExecute=True,
-                allowPii=body.execution.allow_pii,
-            ),
-        })
+        pending_request_id = str(pending.get("requestId") or "").strip()
+        if not validate_query_spec(query_spec_after):
+            return AssistantMessageResponse(
+                requestId=pending_request_id or request_id,
+                sessionId=session_id,
+                intent=intent,
+                status="REQUIRES_CLARIFICATION",
+                message="추가로 확인할 조건이 있습니다. 선택 항목을 확인해주세요.",
+                data={"queryExecutable": False},
+                issues=[],
+                actions=[AssistantAction(type="clarification", payload=clarification_prompt)],
+                clarification=clarification_prompt,
+            )
+        projection.resolve_pending_clarification(
+            session_id=session_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            request_id=pending_request_id,
+            ambiguity_id=pending_answer["ambiguityId"],
+            selected_option=pending_answer["value"],
+            resolved_query_spec=query_spec_after,
+            execution_status="READY_TO_EXECUTE",
+        )
+        agent_body = body.model_copy(update={"tenant_id": tenant_id})
     else:
         intent = classify_business_intent(body.message, body.context)
         query_spec_after = build_initial_query_spec(body.message)
@@ -419,6 +467,26 @@ async def assistant_message(
             if body.action and str(body.action.get("type") or "") == "confirm_execution":
                 agent_request_id = str(body.action.get("requestId") or "").strip()
                 result = await sales_agent_client.execute_request(agent_request_id=agent_request_id, request_id=request_id)
+            elif pending and pending_answer is not None:
+                agent_request_id = str(pending.get("requestId") or "").strip()
+                projection.transition_pending_clarification(
+                    session_id=session_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    request_id=agent_request_id,
+                    status="EXECUTING",
+                )
+                result = await sales_agent_client.execute_request(
+                    agent_request_id=agent_request_id,
+                    request_id=request_id,
+                    payload={
+                        "clarification": {
+                            "ambiguityId": pending_answer["ambiguityId"],
+                            "selectedOption": pending_answer["value"],
+                        },
+                        "querySpec": query_spec_after,
+                    },
+                )
             else:
                 result = await sales_agent_client.submit_request(
                     agent_body,
@@ -426,7 +494,7 @@ async def assistant_message(
                     session_id=session_id,
                 )
             result = _normalize_sales_result(result, tenant_id=tenant_id)
-            if not body.action and projection.config.enabled:
+            if not body.action and not pending and projection.config.enabled:
                 created_request_id = str(result.get("requestId") or "").strip()
                 projection.project(
                     request_id=created_request_id,
@@ -443,7 +511,7 @@ async def assistant_message(
                 )
             if (
                 not body.action
-                and (body.execution.allow_execute or pending_answer is not None)
+                and body.execution.allow_execute
                 and str(result.get("status") or "").upper() == "READY_TO_EXECUTE"
             ):
                 agent_request_id = str(result.get("requestId") or "").strip()
@@ -465,10 +533,13 @@ async def assistant_message(
                 and status == "REQUIRES_CLARIFICATION"
                 and clarification_prompt
             ):
-                next_query_spec = query_spec_after or build_initial_query_spec(
-                    original_message,
-                    result.get("interpretation"),
-                )
+                interpretation = result.get("interpretation")
+                if not isinstance(interpretation, dict) and isinstance(result.get("querySpec"), dict):
+                    interpretation = {"querySpec": result["querySpec"]}
+                next_query_spec = build_initial_query_spec(original_message, interpretation)
+                for key, value in query_spec_after.items():
+                    next_query_spec.setdefault(key, value)
+                next_query_spec = add_pending_ambiguity(next_query_spec, clarification_prompt)
                 projection.save_pending_clarification(
                     request_id=response_request_id,
                     session_id=session_id,
@@ -485,6 +556,8 @@ async def assistant_message(
                     session_id=session_id,
                     tenant_id=tenant_id,
                     user_id=user_id,
+                    request_id=str(pending.get("requestId") or ""),
+                    status=status,
                 )
             if projection.config.enabled:
                 projection.project(
@@ -514,6 +587,14 @@ async def assistant_message(
             status, message = "UNKNOWN", "요청 의도를 확인하지 못했습니다. 요청을 조금 더 구체적으로 입력해 주세요."
     except SalesAgentError as exc:
         status = "ERROR"
+        if pending and projection.config.enabled:
+            projection.complete_pending_clarification(
+                session_id=session_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                request_id=str(pending.get("requestId") or ""),
+                status="ERROR",
+            )
         message = (
             f"요청 조건은 확인됐지만 데이터 조회 중 오류가 발생했습니다. 요청번호: {pending.get('requestId')}"
             if pending
@@ -560,6 +641,14 @@ async def assistant_message(
             "original_message": "[REDACTED]",
             "current_message": "[REDACTED]",
             "pending_request_id": pending.get("requestId") if pending else None,
+            "pending_request_found": pending is not None,
+            "ambiguity_id": pending_answer.get("ambiguityId") if pending_answer else None,
+            "selected_option": pending_answer.get("value") if pending_answer else None,
+            "concept_ref_before": _first_concept_ref(query_spec_before),
+            "concept_ref_after": _first_concept_ref(query_spec_after),
+            "open_blocking_ambiguity_count": _open_blocking_count(query_spec_after),
+            "query_executable_before": bool(query_spec_before.get("queryExecutable")),
+            "query_executable_after": bool(query_spec_after.get("queryExecutable")),
             "clarification_field": pending_answer.get("field") if pending_answer else None,
             "clarification_value": pending_answer.get("value") if pending_answer else None,
             "query_spec_before_fields": sorted(query_spec_before),

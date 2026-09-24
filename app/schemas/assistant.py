@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class BusinessIntent(StrEnum):
@@ -38,10 +38,21 @@ class SalesAgentExecution(BaseModel):
 
 
 class ClarificationAnswer(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    field: str = Field(min_length=1)
-    value: str = Field(min_length=1)
+    ambiguity_id: str | None = Field(default=None, alias="ambiguityId", min_length=1)
+    selected_option: str | None = Field(default=None, alias="selectedOption", min_length=1)
+    # Legacy field/value contract remains accepted during the React migration.
+    field: str | None = Field(default=None, min_length=1)
+    value: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_answer_pair(self) -> "ClarificationAnswer":
+        canonical = self.ambiguity_id is not None and self.selected_option is not None
+        legacy = self.field is not None and self.value is not None
+        if not canonical and not legacy:
+            raise ValueError("clarification requires ambiguityId/selectedOption or field/value")
+        return self
 
 
 class ClarificationOption(BaseModel):
@@ -50,6 +61,9 @@ class ClarificationOption(BaseModel):
 
 
 class ClarificationPrompt(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    ambiguity_id: str | None = Field(default=None, alias="ambiguityId")
     field: str
     type: str = "SINGLE_SELECT"
     options: list[ClarificationOption] = Field(default_factory=list)
@@ -61,6 +75,7 @@ class AssistantMessageRequest(BaseModel):
     # Accept both the direct Gateway contract and the existing BFF context contract.
     tenant_id: str | None = Field(default=None, alias="tenantId", min_length=1)
     session_id: str | None = Field(default=None, alias="sessionId")
+    request_id: str | None = Field(default=None, alias="requestId")
     context: AssistantContext = Field(default_factory=AssistantContext)
     execution: SalesAgentExecution = Field(default_factory=SalesAgentExecution)
     options: dict[str, Any] = Field(default_factory=dict)

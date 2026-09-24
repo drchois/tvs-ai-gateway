@@ -358,19 +358,22 @@ class RequestProjectionService:
             session.commit()
 
     def find_pending_clarification(
-        self, *, session_id: str, tenant_id: str, user_id: str
+        self, *, session_id: str, tenant_id: str, user_id: str, request_id: str | None = None
     ) -> dict[str, Any] | None:
         with Session(self.engine) as session:
-            item = session.scalar(
-                select(PendingClarificationRequest).where(
-                    PendingClarificationRequest.tenant_id == tenant_id,
-                    PendingClarificationRequest.user_id == user_id,
-                    PendingClarificationRequest.session_id == session_id,
-                    PendingClarificationRequest.status == "REQUIRES_CLARIFICATION",
-                )
-            )
+            conditions = [
+                PendingClarificationRequest.tenant_id == tenant_id,
+                PendingClarificationRequest.user_id == user_id,
+                PendingClarificationRequest.session_id == session_id,
+                PendingClarificationRequest.status.in_(("REQUIRES_CLARIFICATION", "READY_TO_EXECUTE", "EXECUTING")),
+            ]
+            if request_id:
+                conditions.append(PendingClarificationRequest.request_id == request_id)
+            item = session.scalar(select(PendingClarificationRequest).where(*conditions))
             if item is None:
                 return None
+            clarification = _load(item.clarification_json, {})
+            resolution = clarification.get("_resolution") if isinstance(clarification, dict) else None
             return {
                 "requestId": item.request_id,
                 "sessionId": item.session_id,
@@ -379,11 +382,73 @@ class RequestProjectionService:
                 "intent": item.intent,
                 "status": item.status,
                 "querySpec": _load(item.query_spec_json, {}),
-                "clarification": _load(item.clarification_json, {}),
+                "clarification": clarification,
+                "resolvedQuerySpec": resolution.get("resolvedQuerySpec") if isinstance(resolution, dict) else None,
+                "ambiguityId": resolution.get("ambiguityId") if isinstance(resolution, dict) else None,
+                "selectedOption": resolution.get("selectedOption") if isinstance(resolution, dict) else None,
+                "executionStatus": item.status,
             }
 
+    def resolve_pending_clarification(
+        self,
+        *,
+        session_id: str,
+        tenant_id: str,
+        user_id: str,
+        request_id: str,
+        ambiguity_id: str,
+        selected_option: str,
+        resolved_query_spec: dict[str, Any],
+        execution_status: str,
+    ) -> None:
+        with Session(self.engine) as session:
+            item = session.scalar(select(PendingClarificationRequest).where(
+                PendingClarificationRequest.tenant_id == tenant_id,
+                PendingClarificationRequest.user_id == user_id,
+                PendingClarificationRequest.session_id == session_id,
+                PendingClarificationRequest.request_id == request_id,
+                PendingClarificationRequest.status == "REQUIRES_CLARIFICATION",
+            ))
+            if item is not None:
+                clarification = _load(item.clarification_json, {})
+                clarification["_resolution"] = {
+                    "ambiguityId": ambiguity_id,
+                    "selectedOption": selected_option,
+                    "resolvedAt": _now().isoformat(),
+                    "resolvedQuerySpec": resolved_query_spec,
+                    "executionStatus": execution_status,
+                    "statusHistory": ["CLARIFICATION_RESOLVED", execution_status],
+                }
+                item.status = execution_status
+                item.clarification_json = _dump(clarification) or "{}"
+                item.updated_at = _now()
+                session.commit()
+
+    def transition_pending_clarification(
+        self, *, session_id: str, tenant_id: str, user_id: str, request_id: str, status: str
+    ) -> None:
+        with Session(self.engine) as session:
+            item = session.scalar(select(PendingClarificationRequest).where(
+                PendingClarificationRequest.tenant_id == tenant_id,
+                PendingClarificationRequest.user_id == user_id,
+                PendingClarificationRequest.session_id == session_id,
+                PendingClarificationRequest.request_id == request_id,
+            ))
+            if item is not None:
+                clarification = _load(item.clarification_json, {})
+                resolution = clarification.setdefault("_resolution", {})
+                history = resolution.setdefault("statusHistory", [])
+                if not history or history[-1] != status:
+                    history.append(status)
+                resolution["executionStatus"] = status
+                item.status = status
+                item.clarification_json = _dump(clarification) or "{}"
+                item.updated_at = _now()
+                session.commit()
+
     def complete_pending_clarification(
-        self, *, session_id: str, tenant_id: str, user_id: str
+        self, *, session_id: str, tenant_id: str, user_id: str, request_id: str | None = None,
+        status: str = "COMPLETED",
     ) -> None:
         with Session(self.engine) as session:
             item = session.scalar(
@@ -391,11 +456,19 @@ class RequestProjectionService:
                     PendingClarificationRequest.tenant_id == tenant_id,
                     PendingClarificationRequest.user_id == user_id,
                     PendingClarificationRequest.session_id == session_id,
-                    PendingClarificationRequest.status == "REQUIRES_CLARIFICATION",
+                    PendingClarificationRequest.status.in_(("REQUIRES_CLARIFICATION", "CLARIFICATION_RESOLVED", "READY_TO_EXECUTE", "EXECUTING")),
                 )
             )
-            if item is not None:
-                item.status = "COMPLETED"
+            if item is not None and (request_id is None or item.request_id == request_id):
+                clarification = _load(item.clarification_json, {})
+                resolution = clarification.get("_resolution")
+                if isinstance(resolution, dict):
+                    history = resolution.setdefault("statusHistory", [])
+                    if not history or history[-1] != status:
+                        history.append(status)
+                    resolution["executionStatus"] = status
+                    item.clarification_json = _dump(clarification) or "{}"
+                item.status = status
                 item.updated_at = _now()
                 session.commit()
 
