@@ -1,0 +1,19 @@
+{
+  "requestId": "REQ-V21-RELATION",
+  "status": "FAILED",
+  "responseSchemaVersion": "2.1",
+  "reasonCode": "RELATION_PATH_UNRESOLVED",
+  "message": "요청한 데이터의 관계 경로를 확인하지 못했습니다.",
+  "semantic": {
+    "version": "SEM-2026-001",
+    "subjectEntity": "CUSTOMER",
+    "relatedEntities": ["PRODUCT"]
+  },
+  "issues": [
+    {
+      "code": "RELATION_PATH_UNRESOLVED",
+      "severity": "warning",
+      "message": "고객과 상품 사이의 조회 관계를 확인해주세요."
+    }
+  ]
+}

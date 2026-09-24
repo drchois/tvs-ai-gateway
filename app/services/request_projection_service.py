@@ -66,6 +66,10 @@ class UserDataRequest(Base):
     reason_code: Mapped[str | None] = mapped_column(String(128))
     message: Mapped[str | None] = mapped_column(Text)
     result_profile_id: Mapped[str | None] = mapped_column(String(128))
+    semantic_version: Mapped[str | None] = mapped_column(String(128))
+    subject_entity: Mapped[str | None] = mapped_column(String(128))
+    related_entities_json: Mapped[str | None] = mapped_column(Text)
+    business_concepts_json: Mapped[str | None] = mapped_column(Text)
     interpretation_json: Mapped[str | None] = mapped_column(Text)
     issues_json: Mapped[str | None] = mapped_column(Text)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -86,6 +90,7 @@ class UserDataRequestResult(Base):
     truncated: Mapped[bool] = mapped_column(default=False)
     summary_json: Mapped[str | None] = mapped_column(Text)
     columns_json: Mapped[str | None] = mapped_column(Text)
+    definitions_json: Mapped[str | None] = mapped_column(Text)
     preview_rows_json: Mapped[str | None] = mapped_column(Text)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -146,12 +151,23 @@ class RequestProjectionService:
             return
         db_inspector = inspect(self.engine)
         request_columns = {column["name"] for column in db_inspector.get_columns("user_data_request")}
+        result_columns = {column["name"] for column in db_inspector.get_columns("user_data_request_result")}
         artifact_columns = {
             column["name"] for column in db_inspector.get_columns("user_data_request_artifact")
         }
         with self.engine.begin() as connection:
             if "intent" not in request_columns:
                 connection.execute(text("ALTER TABLE user_data_request ADD COLUMN intent VARCHAR(64)"))
+            if "semantic_version" not in request_columns:
+                connection.execute(text("ALTER TABLE user_data_request ADD COLUMN semantic_version VARCHAR(128)"))
+            if "subject_entity" not in request_columns:
+                connection.execute(text("ALTER TABLE user_data_request ADD COLUMN subject_entity VARCHAR(128)"))
+            if "related_entities_json" not in request_columns:
+                connection.execute(text("ALTER TABLE user_data_request ADD COLUMN related_entities_json TEXT"))
+            if "business_concepts_json" not in request_columns:
+                connection.execute(text("ALTER TABLE user_data_request ADD COLUMN business_concepts_json TEXT"))
+            if "definitions_json" not in result_columns:
+                connection.execute(text("ALTER TABLE user_data_request_result ADD COLUMN definitions_json TEXT"))
             if "tenant_id" not in artifact_columns:
                 connection.execute(
                     text("ALTER TABLE user_data_request_artifact ADD COLUMN tenant_id VARCHAR(128)")
@@ -185,6 +201,7 @@ class RequestProjectionService:
         now = _now()
         status = str(response.get("status") or "RECEIVED")
         result = response.get("result") if isinstance(response.get("result"), dict) else None
+        semantic = response.get("semantic") if isinstance(response.get("semantic"), dict) else None
         terminal = status in {"COMPLETED", "FAILED", "BLOCKED"}
         with Session(self.engine) as session:
             item = session.scalar(select(UserDataRequest).where(UserDataRequest.request_id == request_id))
@@ -210,7 +227,13 @@ class RequestProjectionService:
             item.message = response.get("message")
             item.interpretation_json = _dump(response.get("interpretation"))
             item.issues_json = _dump(response.get("issues") or [])
-            item.result_profile_id = result.get("profileId") if result else None
+            item.result_profile_id = (
+                result.get("profileId") if result else None
+            ) or (semantic.get("resultProfileId") if semantic else None)
+            item.semantic_version = semantic.get("version") if semantic else None
+            item.subject_entity = semantic.get("subjectEntity") if semantic else None
+            item.related_entities_json = _dump(semantic.get("relatedEntities") or []) if semantic else None
+            item.business_concepts_json = _dump(semantic.get("businessConcepts") or []) if semantic else None
             item.completed_at = now if terminal else None
             item.updated_at = now
             if result is not None:
@@ -233,6 +256,7 @@ class RequestProjectionService:
                 )
                 projected.summary_json = _dump(result.get("summary"))
                 projected.columns_json = _dump(result.get("columns") or [])
+                projected.definitions_json = _dump(result.get("definitions") or [])
                 projected.preview_rows_json = _dump(preview_rows)
                 projected.completed_at = now if terminal else None
                 projected.updated_at = now
@@ -242,6 +266,8 @@ class RequestProjectionService:
                         session, request_id, tenant_id, download, projected.row_count, now
                     )
             artifact = response.get("artifact") if isinstance(response.get("artifact"), dict) else None
+            if artifact is None and result and isinstance(result.get("artifact"), dict):
+                artifact = result.get("artifact")
             if artifact and artifact.get("artifactId"):
                 self._upsert_artifact(
                     session,
@@ -368,12 +394,23 @@ class RequestProjectionService:
             "tenantId": item.tenant_id, "userId": item.user_id, "intent": item.intent,
             "requestText": item.request_text, "status": item.status, "reasonCode": item.reason_code,
             "message": item.message, "interpretation": _load(item.interpretation_json, None),
+            "semantic": {
+                "version": item.semantic_version,
+                "subjectEntity": item.subject_entity,
+                "relatedEntities": _load(item.related_entities_json, []),
+                "businessConcepts": _load(item.business_concepts_json, []),
+                "resultProfileId": item.result_profile_id,
+            } if (
+                item.semantic_version or item.subject_entity or item.related_entities_json
+                or item.business_concepts_json
+            ) else None,
             "issues": _load(item.issues_json, []), "requestedAt": item.requested_at,
             "startedAt": item.started_at, "completedAt": item.completed_at,
             "result": None if result is None else {
                 "profileId": result.result_profile_id, "resultMode": result.result_mode,
                 "rowCount": result.row_count, "truncated": result.truncated,
                 "summary": _load(result.summary_json, None), "columns": _load(result.columns_json, []),
+                "definitions": _load(result.definitions_json, []),
                 "rows": _load(result.preview_rows_json, []),
             },
             "artifacts": [{

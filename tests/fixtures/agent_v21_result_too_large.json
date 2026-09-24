@@ -1,0 +1,21 @@
+{
+  "requestId": "REQ-V21-LARGE",
+  "status": "BLOCKED",
+  "responseSchemaVersion": "2.1",
+  "reasonCode": "RESULT_TOO_LARGE",
+  "message": "조회 결과가 너무 많습니다.",
+  "semantic": {
+    "version": "SEM-2026-001",
+    "subjectEntity": "SALE",
+    "resultProfileId": "SALES_DETAIL"
+  },
+  "issues": [
+    {"code": "RESULT_TOO_LARGE", "severity": "warning", "message": "조회 조건을 좁혀주세요."}
+  ],
+  "refinement": {
+    "limit": 100,
+    "resultCount": 1200,
+    "countExact": true,
+    "suggestions": ["SHORTEN_PERIOD", "SPECIFY_PRODUCT"]
+  }
+}

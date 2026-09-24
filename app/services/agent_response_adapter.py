@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.schemas.sales_agent_response import AgentResponseV2, NormalizedAgentResult
+from app.schemas.sales_agent_response import AgentResponseV2, AgentResponseV21, NormalizedAgentResult
 
 
 class UnsupportedAgentSchemaVersion(ValueError):
@@ -13,12 +13,22 @@ def normalize_agent_response(raw: dict[str, Any]) -> NormalizedAgentResult:
     version = raw.get("responseSchemaVersion")
     if version is None:
         return _adapt_v1(raw)
-    if str(version) != "2.0":
-        raise UnsupportedAgentSchemaVersion(f"Unsupported Agent response schema version: {version}")
-    return _adapt_v2(AgentResponseV2.model_validate(raw))
+    if str(version) == "2.0":
+        return _adapt_v2(AgentResponseV2.model_validate(raw))
+    if str(version) == "2.1":
+        return _adapt_v21(AgentResponseV21.model_validate(raw))
+    raise UnsupportedAgentSchemaVersion(f"Unsupported Agent response schema version: {version}")
 
 
 def _adapt_v2(response: AgentResponseV2) -> NormalizedAgentResult:
+    return _adapt_current(response)
+
+
+def _adapt_v21(response: AgentResponseV21) -> NormalizedAgentResult:
+    return _adapt_current(response)
+
+
+def _adapt_current(response: AgentResponseV2) -> NormalizedAgentResult:
     # Validation must not cause default metadata to be injected into Agent-owned columns.
     payload = response.model_dump(by_alias=True, exclude_none=True, exclude_unset=True)
     status = "READY_TO_EXECUTE" if response.status == "READY" else response.status

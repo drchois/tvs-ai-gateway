@@ -15,7 +15,7 @@ from sqlalchemy import inspect, text
 from app.core.config import RequestProjectionConfig, SalesAgentConfig
 from app.core.config import MinioConfig
 from app.schemas.assistant import AssistantContext, AssistantMessageRequest, BusinessIntent
-from app.schemas.sales_agent_response import AgentResponseV2
+from app.schemas.sales_agent_response import AgentResponseV2, AgentResponseV21
 from app.services.agent_response_adapter import (
     UnsupportedAgentSchemaVersion,
     normalize_agent_response,
@@ -141,6 +141,90 @@ class AgentResponseAdapterTests(unittest.TestCase):
     def test_v2_ready_maps_to_front_compatible_status(self) -> None:
         normalized = normalize_agent_response(self.fixture("agent_response_v2_ready.json"))
         self.assertEqual(normalized.status, "READY_TO_EXECUTE")
+
+    def test_v21_semantic_and_dynamic_metadata_are_preserved(self) -> None:
+        raw = self.fixture("agent_v21_sales_summary.json")
+        parsed = AgentResponseV21.model_validate(raw)
+        normalized = normalize_agent_response(raw).model_dump(
+            by_alias=True, exclude_none=True, exclude_unset=True
+        )
+
+        self.assertEqual(parsed.response_schema_version, "2.1")
+        self.assertEqual(normalized["responseSchemaVersion"], "2.1")
+        self.assertEqual(normalized["semantic"], raw["semantic"])
+        self.assertEqual(
+            normalized["result"]["futureResultMetadata"],
+            raw["result"]["futureResultMetadata"],
+        )
+
+    def test_v21_reference_fixtures_are_all_supported(self) -> None:
+        fixtures = (
+            "agent_v21_sales_summary.json",
+            "agent_v21_customer_detail.json",
+            "agent_v21_new_customer_clarification.json",
+            "agent_v21_result_too_large.json",
+            "agent_v21_relation_unresolved.json",
+        )
+        for fixture_name in fixtures:
+            with self.subTest(fixture=fixture_name):
+                normalized = normalize_agent_response(self.fixture(fixture_name))
+                self.assertEqual(normalized.response_schema_version, "2.1")
+                self.assertIsNotNone(normalized.semantic)
+
+    def test_v21_customer_result_maps_semantic_definitions_and_artifact(self) -> None:
+        from app.api.assistant import _sales_response
+
+        raw = self.fixture("agent_v21_customer_detail.json")
+        normalized = normalize_agent_response(raw).model_dump(by_alias=True, exclude_none=True)
+        status, _, _, data, _, actions = _sales_response(normalized)
+
+        self.assertEqual(status, "COMPLETED")
+        self.assertEqual(data["semantic"], raw["semantic"])
+        self.assertEqual(data["result"]["definitions"], raw["result"]["definitions"])
+        self.assertEqual(data["result"]["columns"][0]["role"], "DIMENSION")
+        self.assertEqual(
+            data["result"]["columns"][0]["selectionReason"],
+            raw["result"]["columns"][0]["selectionReason"],
+        )
+        self.assertNotIn("downloadUrl", data["artifact"])
+        download = next(action for action in actions if action.type == "download_file")
+        self.assertEqual(
+            download.payload["url"],
+            "/api/artifacts/ART-V21-CUSTOMER/download",
+        )
+
+    def test_v21_clarification_preserves_options_and_semantic(self) -> None:
+        from app.api.assistant import _sales_response
+
+        raw = self.fixture("agent_v21_new_customer_clarification.json")
+        normalized = normalize_agent_response(raw).model_dump(by_alias=True, exclude_none=True)
+        status, _, _, data, _, actions = _sales_response(normalized)
+
+        self.assertEqual(status, "REQUIRES_CLARIFICATION")
+        self.assertEqual(data["semantic"], raw["semantic"])
+        self.assertEqual(actions[0].type, "clarification")
+        self.assertEqual(actions[0].payload["questions"], raw["questions"])
+
+    def test_v21_semantic_failures_keep_business_codes(self) -> None:
+        from app.api.assistant import _sales_response
+
+        too_large = normalize_agent_response(
+            self.fixture("agent_v21_result_too_large.json")
+        ).model_dump(by_alias=True, exclude_none=True)
+        status, _, _, data, issues, actions = _sales_response(too_large)
+        self.assertEqual(status, "BLOCKED")
+        self.assertEqual(data["reasonCode"], "RESULT_TOO_LARGE")
+        self.assertEqual(issues[0]["code"], "RESULT_TOO_LARGE")
+        self.assertEqual(actions[0].type, "refine_request")
+
+        unresolved = normalize_agent_response(
+            self.fixture("agent_v21_relation_unresolved.json")
+        ).model_dump(by_alias=True, exclude_none=True)
+        status, _, _, data, issues, actions = _sales_response(unresolved)
+        self.assertEqual(status, "FAILED")
+        self.assertEqual(data["reasonCode"], "RELATION_PATH_UNRESOLVED")
+        self.assertEqual(issues[0]["code"], "RELATION_PATH_UNRESOLVED")
+        self.assertEqual(actions[0].payload["errorCode"], "RELATION_PATH_UNRESOLVED")
 
     def test_v2_ready_to_execute_from_live_agent_is_accepted(self) -> None:
         normalized = normalize_agent_response({
@@ -300,6 +384,36 @@ class AgentResponseAdapterTests(unittest.TestCase):
 
 
 class RequestProjectionTests(unittest.TestCase):
+    fixtures = Path("tests/fixtures")
+
+    def fixture(self, name: str) -> dict:
+        return json.loads((self.fixtures / name).read_text(encoding="utf-8"))
+
+    def test_v21_semantic_result_projection_is_preserved(self) -> None:
+        with TemporaryDirectory() as directory:
+            service = RequestProjectionService(RequestProjectionConfig(
+                database_url=f"sqlite:///{Path(directory) / 'projection.db'}",
+            ))
+            raw = self.fixture("agent_v21_customer_detail.json")
+            response = normalize_agent_response(raw).model_dump(
+                by_alias=True, exclude_none=True
+            )
+            service.project(
+                request_id=raw["requestId"],
+                agent_request_id=raw["requestId"],
+                tenant_id="tenant-a",
+                user_id="user-a",
+                request_text="new customers",
+                response=response,
+            )
+
+            detail = service.get_owned(raw["requestId"], "tenant-a", "user-a", [])
+            self.assertEqual(detail["semantic"], raw["semantic"])
+            self.assertEqual(detail["result"]["definitions"], raw["result"]["definitions"])
+            self.assertEqual(detail["result"]["columns"], raw["result"]["columns"])
+            self.assertEqual(detail["artifacts"][0]["artifactId"], "ART-V21-CUSTOMER")
+            service.engine.dispose()
+
     def test_projection_preview_history_and_access_control(self) -> None:
         with TemporaryDirectory() as directory:
             service = RequestProjectionService(RequestProjectionConfig(
@@ -389,6 +503,11 @@ class RequestProjectionTests(unittest.TestCase):
                 connection.execute(text("DROP INDEX ix_user_data_request_intent"))
                 connection.execute(text("DROP INDEX ix_user_data_request_artifact_tenant_id"))
                 connection.execute(text("ALTER TABLE user_data_request DROP COLUMN intent"))
+                connection.execute(text("ALTER TABLE user_data_request DROP COLUMN semantic_version"))
+                connection.execute(text("ALTER TABLE user_data_request DROP COLUMN subject_entity"))
+                connection.execute(text("ALTER TABLE user_data_request DROP COLUMN related_entities_json"))
+                connection.execute(text("ALTER TABLE user_data_request DROP COLUMN business_concepts_json"))
+                connection.execute(text("ALTER TABLE user_data_request_result DROP COLUMN definitions_json"))
                 connection.execute(text(
                     "ALTER TABLE user_data_request_artifact DROP COLUMN tenant_id"
                 ))
@@ -411,6 +530,15 @@ class RequestProjectionTests(unittest.TestCase):
                 for index in db_inspector.get_indexes("user_data_request_artifact")
             }
             self.assertIn("intent", request_columns)
+            self.assertIn("semantic_version", request_columns)
+            self.assertIn("subject_entity", request_columns)
+            self.assertIn("related_entities_json", request_columns)
+            self.assertIn("business_concepts_json", request_columns)
+            result_columns = {
+                column["name"]
+                for column in db_inspector.get_columns("user_data_request_result")
+            }
+            self.assertIn("definitions_json", result_columns)
             self.assertIn("tenant_id", artifact_columns)
             self.assertIn("ix_user_data_request_intent", request_indexes)
             self.assertIn("ix_user_data_request_artifact_tenant_id", artifact_indexes)

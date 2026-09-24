@@ -1,0 +1,46 @@
+{
+  "requestId": "REQ-V21-CUSTOMER",
+  "status": "COMPLETED",
+  "responseSchemaVersion": "2.1",
+  "message": "신규고객 조회가 완료되었습니다.",
+  "semantic": {
+    "version": "SEM-2026-001",
+    "subjectEntity": "CUSTOMER",
+    "relatedEntities": ["SALE", "PRODUCT"],
+    "businessConcepts": ["BRAND_NEW_CUSTOMER"],
+    "resultProfileId": "CUSTOMER_DETAIL"
+  },
+  "result": {
+    "profileId": "CUSTOMER_DETAIL",
+    "resultMode": "DETAIL",
+    "rowCount": 1,
+    "columns": [
+      {
+        "key": "customer.name",
+        "label": "고객명",
+        "dataType": "STRING",
+        "role": "DIMENSION",
+        "visible": true,
+        "sortable": true,
+        "pii": true,
+        "masked": true,
+        "selectionReason": "신규고객 명단 식별"
+      }
+    ],
+    "rows": [{"customer.name": "김**"}],
+    "definitions": [
+      {
+        "key": "BRAND_NEW_CUSTOMER",
+        "label": "신규고객",
+        "description": "해당 브랜드의 이전 구매 이력이 없는 고객"
+      }
+    ],
+    "artifact": {
+      "artifactId": "ART-V21-CUSTOMER",
+      "fileName": "new-customers.xlsx",
+      "status": "READY",
+      "contentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "downloadUrl": "/api/v1/artifacts/ART-V21-CUSTOMER/download"
+    }
+  }
+}

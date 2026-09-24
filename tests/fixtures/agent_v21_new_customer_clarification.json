@@ -1,0 +1,22 @@
+{
+  "requestId": "REQ-V21-CLARIFICATION",
+  "status": "REQUIRES_CLARIFICATION",
+  "responseSchemaVersion": "2.1",
+  "reasonCode": "BUSINESS_DEFINITION_AMBIGUOUS",
+  "message": "신규 고객의 기준을 선택해주세요.",
+  "semantic": {
+    "version": "SEM-2026-001",
+    "subjectEntity": "CUSTOMER",
+    "businessConcepts": ["NEW_CUSTOMER"]
+  },
+  "questions": [
+    {
+      "questionId": "new-customer-definition",
+      "message": "신규고객 기준을 선택해주세요.",
+      "options": [
+        {"value": "BRAND_FIRST", "label": "브랜드 최초 구매"},
+        {"value": "STORE_FIRST", "label": "매장 최초 구매"}
+      ]
+    }
+  ]
+}

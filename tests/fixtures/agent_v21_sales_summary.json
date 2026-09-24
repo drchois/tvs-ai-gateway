@@ -1,0 +1,28 @@
+{
+  "requestId": "REQ-V21-SUMMARY",
+  "status": "COMPLETED",
+  "responseSchemaVersion": "2.1",
+  "message": "판매 요약 조회가 완료되었습니다.",
+  "semantic": {
+    "version": "SEM-2026-001",
+    "subjectEntity": "PRODUCT",
+    "relatedEntities": ["SALE", "STORE"],
+    "businessConcepts": ["NET_SALES"],
+    "resultProfileId": "PRODUCT_SALES_SUMMARY",
+    "futureMetadata": {"source": "agent"}
+  },
+  "result": {
+    "profileId": "PRODUCT_SALES_SUMMARY",
+    "resultMode": "SUMMARY_ONLY",
+    "rowCount": 1,
+    "summary": {
+      "items": [
+        {"key": "sales.netAmount", "label": "순매출", "value": 128000, "dataType": "DECIMAL", "format": "KRW"}
+      ]
+    },
+    "columns": [],
+    "rows": [],
+    "definitions": [],
+    "futureResultMetadata": {"preserved": true}
+  }
+}

@@ -19,6 +19,8 @@ class ResultColumn(AgentContractModel):
     pii: bool = False
     masked: bool = False
     exportable: bool = True
+    role: str | None = None
+    selection_reason: str | None = Field(default=None, alias="selectionReason")
 
 
 class ResultSummaryItem(AgentContractModel):
@@ -42,6 +44,23 @@ class ResultDownload(AgentContractModel):
     object_key: str | None = Field(default=None, alias="objectKey", exclude=True)
 
 
+class ResultArtifact(AgentContractModel):
+    artifact_id: str | None = Field(default=None, alias="artifactId")
+    artifact_type: str | None = Field(default=None, alias="artifactType")
+    file_name: str | None = Field(default=None, alias="fileName")
+    status: str | None = None
+    file_size: int | None = Field(default=None, alias="fileSize")
+    row_count: int | None = Field(default=None, alias="rowCount")
+    expires_at: str | None = Field(default=None, alias="expiresAt")
+    content_type: str | None = Field(default=None, alias="contentType")
+    media_type: str | None = Field(default=None, alias="mediaType")
+    encrypted: bool | None = None
+    download_url: str | None = Field(default=None, alias="downloadUrl")
+    storage_type: str | None = Field(default=None, alias="storageType", exclude=True)
+    bucket_name: str | None = Field(default=None, alias="bucketName", exclude=True)
+    object_key: str | None = Field(default=None, alias="objectKey", exclude=True)
+
+
 class ResultRefinement(AgentContractModel):
     limit: int | None = Field(default=None, ge=0)
     result_count: int | None = Field(default=None, alias="resultCount", ge=0)
@@ -51,7 +70,7 @@ class ResultRefinement(AgentContractModel):
 
 class ResultPayload(AgentContractModel):
     profile_id: str = Field(alias="profileId")
-    result_mode: str = Field(alias="resultMode")
+    result_mode: str | None = Field(default=None, alias="resultMode")
     summary: dict[str, Any] | None = None
     columns: list[ResultColumn]
     rows: list[dict[str, Any]]
@@ -61,6 +80,7 @@ class ResultPayload(AgentContractModel):
     definitions: list[dict[str, Any]] = Field(default_factory=list)
     presentation: dict[str, Any] | None = None
     download: ResultDownload | None = None
+    artifact: ResultArtifact | None = None
 
 
 class AgentResponseV2(AgentContractModel):
@@ -82,7 +102,7 @@ class AgentResponseV2(AgentContractModel):
     refinement: ResultRefinement | None = None
     questions: list[dict[str, Any]] = Field(default_factory=list)
     issues: list[dict[str, Any]] = Field(default_factory=list)
-    artifact: dict[str, Any] | None = None
+    artifact: ResultArtifact | None = None
 
 
 class NormalizedAgentResult(AgentContractModel):
@@ -91,6 +111,7 @@ class NormalizedAgentResult(AgentContractModel):
     response_schema_version: str = Field(alias="responseSchemaVersion")
     reason_code: str | None = Field(default=None, alias="reasonCode")
     message: str | None = None
+    semantic: dict[str, Any] | None = None
     interpretation: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     row_estimate: dict[str, Any] | None = Field(default=None, alias="rowEstimate")
@@ -100,3 +121,8 @@ class NormalizedAgentResult(AgentContractModel):
     issues: list[dict[str, Any]] = Field(default_factory=list)
     artifact: dict[str, Any] | None = None
     legacy: bool = False
+
+
+class AgentResponseV21(AgentResponseV2):
+    response_schema_version: Literal["2.1"] = Field(alias="responseSchemaVersion")
+    semantic: dict[str, Any] | None = None

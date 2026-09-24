@@ -117,8 +117,9 @@ def _sales_response(
         "responseSchemaVersion": str(result.get("responseSchemaVersion") or "1.0"),
         "legacy": bool(result.get("legacy", False)),
     }
-    for key in ("reasonCode", "interpretation", "rowEstimate", "suggestedRefinements", "refinement"):
-        if key in result and result[key] is not None:
+    structural_keys = {"requestId", "status", "message", "result", "artifact", "questions", "issues"}
+    for key, value in result.items():
+        if key not in structural_keys and value is not None:
             data[key] = result[key]
     agent_result = result.get("result")
     if isinstance(agent_result, dict):
@@ -139,6 +140,8 @@ def _sales_response(
             if key in agent_result:
                 data[key] = agent_result[key]
     artifact = result.get("artifact")
+    if not isinstance(artifact, dict) and isinstance(agent_result, dict):
+        artifact = agent_result.get("artifact")
     safe_artifact: dict[str, object] = {}
     if isinstance(artifact, dict):
         for key in (
@@ -220,6 +223,12 @@ def _sales_response(
             [AssistantAction(type="safe_error", payload={"errorCode": "SALES_AGENT_UNSUPPORTED_STATUS"})],
         )
     payload: dict[str, object] = {"requestId": agent_request_id}
+    if public_status in {"FAILED", "ERROR", "BLOCKED"}:
+        semantic_error_code = str(result.get("reasonCode") or "").strip()
+        if not semantic_error_code and issues:
+            semantic_error_code = str(issues[0].get("code") or "").strip()
+        if semantic_error_code:
+            payload["errorCode"] = semantic_error_code
     if status == "REQUIRES_CLARIFICATION":
         payload["questions"] = questions
     if status == "READY_TO_EXECUTE":
@@ -412,6 +421,29 @@ async def assistant_message(
             "upstream_service": "tv-sales-agent" if intent is BusinessIntent.SALES_DATA_REQUEST else None,
             "status": status,
             "issue_codes": [str(item.get("code") or "") for item in issues],
+            "semantic_version": (
+                data.get("semantic", {}).get("version")
+                if isinstance(data.get("semantic"), dict) else None
+            ),
+            "result_profile_id": (
+                (
+                    data.get("result", {}).get("profileId")
+                    if isinstance(data.get("result"), dict) else None
+                )
+                or (
+                    data.get("semantic", {}).get("resultProfileId")
+                    if isinstance(data.get("semantic"), dict) else None
+                )
+            ),
+            "subject_entity": (
+                data.get("semantic", {}).get("subjectEntity")
+                if isinstance(data.get("semantic"), dict) else None
+            ),
+            "agent_status": status,
+            "row_count": (
+                data.get("result", {}).get("rowCount")
+                if isinstance(data.get("result"), dict) else None
+            ),
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
         },
     )
