@@ -10,6 +10,10 @@ class BusinessIntent(StrEnum):
     CHAT = "CHAT"
     RAG_QA = "RAG_QA"
     SALES_DATA_REQUEST = "SALES_DATA_REQUEST"
+    CUSTOMER_DATA_REQUEST = "CUSTOMER_DATA_REQUEST"
+    PRODUCT_DATA_REQUEST = "PRODUCT_DATA_REQUEST"
+    STORE_DATA_REQUEST = "STORE_DATA_REQUEST"
+    EMPLOYEE_DATA_REQUEST = "EMPLOYEE_DATA_REQUEST"
     SALES_INSIGHT = "SALES_INSIGHT"
     ARTIFACT_ACTION = "ARTIFACT_ACTION"
     CRM_INTELLIGENCE = "CRM_INTELLIGENCE"
@@ -33,6 +37,24 @@ class SalesAgentExecution(BaseModel):
     allow_pii: bool = Field(default=False, alias="allowPii")
 
 
+class ClarificationAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: str = Field(min_length=1)
+    value: str = Field(min_length=1)
+
+
+class ClarificationOption(BaseModel):
+    label: str
+    value: str
+
+
+class ClarificationPrompt(BaseModel):
+    field: str
+    type: str = "SINGLE_SELECT"
+    options: list[ClarificationOption] = Field(default_factory=list)
+
+
 class AssistantMessageRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     message: str = Field(min_length=1)
@@ -43,6 +65,7 @@ class AssistantMessageRequest(BaseModel):
     execution: SalesAgentExecution = Field(default_factory=SalesAgentExecution)
     options: dict[str, Any] = Field(default_factory=dict)
     action: dict[str, Any] | None = None
+    clarification: ClarificationAnswer | None = None
 
 
 class SalesAgentRequest(BaseModel):
@@ -71,3 +94,4 @@ class AssistantMessageResponse(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
     issues: list[dict[str, Any]] = Field(default_factory=list)
     actions: list[AssistantAction] = Field(default_factory=list)
+    clarification: ClarificationPrompt | None = None

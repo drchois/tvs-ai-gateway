@@ -19,8 +19,16 @@ from app.schemas.assistant import (
     AssistantMessageRequest,
     AssistantMessageResponse,
     BusinessIntent,
+    SalesAgentExecution,
 )
-from app.services.assistant_intent_router import classify_business_intent
+from app.services.assistant_intent_router import classify_business_intent, is_tv_sales_intent
+from app.services.clarification_service import (
+    build_initial_query_spec,
+    build_merged_message,
+    extract_clarification,
+    merge_query_spec,
+    resolve_clarification_answer,
+)
 from app.services.agent_response_adapter import (
     UnsupportedAgentSchemaVersion,
     normalize_agent_response,
@@ -186,13 +194,20 @@ def _sales_response(
         )
 
     if questions:
+        clarification = extract_clarification(result)
+        clarification_payload: dict[str, object] = {
+            "requestId": agent_request_id,
+            "questions": questions,
+        }
+        if clarification:
+            clarification_payload.update(clarification)
         return (
             "REQUIRES_CLARIFICATION",
             message,
             agent_request_id,
             data,
             issues,
-            [AssistantAction(type="clarification", payload={"requestId": agent_request_id, "questions": questions})],
+            [AssistantAction(type="clarification", payload=clarification_payload)],
         )
     if "QUERY_BLOCKED" in issue_codes:
         blocked_message = message if result.get("message") else "요청을 실행 가능한 조회조건으로 확정하지 못했습니다."
@@ -231,6 +246,9 @@ def _sales_response(
             payload["errorCode"] = semantic_error_code
     if status == "REQUIRES_CLARIFICATION":
         payload["questions"] = questions
+        clarification = extract_clarification(result)
+        if clarification:
+            payload.update(clarification)
     if status == "READY_TO_EXECUTE":
         payload["label"] = "조회 실행"
     actions = [AssistantAction(type=action_by_status[public_status], label="조회 실행" if status == "READY_TO_EXECUTE" else None, payload=payload)]
@@ -308,30 +326,96 @@ async def assistant_message(
     request_id = str(getattr(http_request.state, "request_id", "") or uuid4().hex)
     LOG.info("request.received", extra={"event": "request.received"})
     session_id = (body.session_id or f"assistant-{uuid4().hex[:12]}").strip()
-    intent = classify_business_intent(body.message, body.context)
+    identity = request_context.resolve(
+        tenant_id=body.tenant_id or body.context.tenant_id,
+        user_id=body.context.user_id,
+    )
+    tenant_id = identity.tenant_id or "default"
+    user_id = identity.user_id or "anonymous"
+    is_confirm_action = bool(
+        body.action and str(body.action.get("type") or "") == "confirm_execution"
+    )
+    pending = (
+        projection.find_pending_clarification(
+            session_id=session_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        if projection.config.enabled and body.session_id and not is_confirm_action
+        else None
+    )
+    pending_answer: dict[str, str] | None = None
+    clarification_prompt: dict[str, object] | None = None
+    query_spec_before: dict[str, object] = {}
+    query_spec_after: dict[str, object] = {}
+    original_message = body.message
+
+    if pending:
+        try:
+            intent = BusinessIntent(str(pending.get("intent") or "SALES_DATA_REQUEST"))
+        except ValueError:
+            intent = BusinessIntent.SALES_DATA_REQUEST
+        clarification_prompt = dict(pending.get("clarification") or {})
+        pending_answer = resolve_clarification_answer(
+            clarification_prompt,
+            body.message,
+            body.clarification,
+        )
+        if pending_answer is None:
+            LOG.info(
+                "clarification.unresolved",
+                extra={
+                    "event": "clarification.unresolved",
+                    "session_id": session_id,
+                    "pending_request_id": pending.get("requestId"),
+                    "intent": intent.value,
+                    "domain": "TV_SALES",
+                    "clarification_field": clarification_prompt.get("field"),
+                },
+            )
+            return AssistantMessageResponse(
+                requestId=str(pending.get("requestId") or request_id),
+                sessionId=session_id,
+                intent=intent,
+                status="REQUIRES_CLARIFICATION",
+                message="조회에 필요한 조건이 하나 더 있습니다. 선택 항목을 확인해주세요.",
+                data={},
+                issues=[],
+                actions=[AssistantAction(type="clarification", payload=clarification_prompt)],
+                clarification=clarification_prompt,
+            )
+        original_message = str(pending.get("originalMessage") or body.message)
+        query_spec_before = dict(pending.get("querySpec") or {})
+        query_spec_after = merge_query_spec(query_spec_before, pending_answer)
+        agent_body = body.model_copy(update={
+            "tenant_id": tenant_id,
+            "message": build_merged_message(original_message, pending_answer),
+            "execution": SalesAgentExecution(
+                allowExecute=True,
+                allowPii=body.execution.allow_pii,
+            ),
+        })
+    else:
+        intent = classify_business_intent(body.message, body.context)
+        query_spec_after = build_initial_query_spec(body.message)
+        agent_body = body.model_copy(update={"tenant_id": tenant_id})
     if body.action and str(body.action.get("type") or "") == "confirm_execution":
         intent = BusinessIntent.SALES_DATA_REQUEST
     status, message, data, issues, actions = "COMPLETED", "", {}, [], []
     response_request_id = request_id
-    if intent is not BusinessIntent.SALES_DATA_REQUEST:
+    if not is_tv_sales_intent(intent):
         return AssistantMessageResponse(
             requestId=request_id,
             sessionId=session_id,
             intent=intent,
             status="NOT_SUPPORTED",
-            message="현재 Gateway는 판매 데이터 조회 요청만 지원합니다.",
+            message="현재 TV Sales에서 처리할 수 없는 요청입니다.",
             data={},
             issues=[],
             actions=[],
         )
-    identity = request_context.resolve(
-        tenant_id=body.tenant_id or body.context.tenant_id,
-        user_id=body.context.user_id,
-    )
-    agent_body = body.model_copy(update={"tenant_id": identity.tenant_id})
-
     try:
-        if intent is BusinessIntent.SALES_DATA_REQUEST:
+        if is_tv_sales_intent(intent):
             if body.action and str(body.action.get("type") or "") == "confirm_execution":
                 agent_request_id = str(body.action.get("requestId") or "").strip()
                 result = await sales_agent_client.execute_request(agent_request_id=agent_request_id, request_id=request_id)
@@ -341,14 +425,14 @@ async def assistant_message(
                     request_id=request_id,
                     session_id=session_id,
                 )
-            result = _normalize_sales_result(result, tenant_id=identity.tenant_id or "default")
+            result = _normalize_sales_result(result, tenant_id=tenant_id)
             if not body.action and projection.config.enabled:
                 created_request_id = str(result.get("requestId") or "").strip()
                 projection.project(
                     request_id=created_request_id,
                     agent_request_id=created_request_id,
-                    tenant_id=identity.tenant_id or "default",
-                    user_id=identity.user_id or "anonymous",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
                     request_text=body.message,
                     response=result,
                     intent=intent.value,
@@ -359,7 +443,7 @@ async def assistant_message(
                 )
             if (
                 not body.action
-                and body.execution.allow_execute
+                and (body.execution.allow_execute or pending_answer is not None)
                 and str(result.get("status") or "").upper() == "READY_TO_EXECUTE"
             ):
                 agent_request_id = str(result.get("requestId") or "").strip()
@@ -372,15 +456,42 @@ async def assistant_message(
                     agent_request_id=agent_request_id,
                     request_id=request_id,
                 )
-                result = _normalize_sales_result(result, tenant_id=identity.tenant_id or "default")
+                result = _normalize_sales_result(result, tenant_id=tenant_id)
             status, message, agent_request_id, data, issues, actions = _sales_response(result)
             response_request_id = agent_request_id or request_id
+            clarification_prompt = extract_clarification(result)
+            if (
+                projection.config.enabled
+                and status == "REQUIRES_CLARIFICATION"
+                and clarification_prompt
+            ):
+                next_query_spec = query_spec_after or build_initial_query_spec(
+                    original_message,
+                    result.get("interpretation"),
+                )
+                projection.save_pending_clarification(
+                    request_id=response_request_id,
+                    session_id=session_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    original_message=original_message,
+                    intent=intent.value,
+                    query_spec=next_query_spec,
+                    clarification=clarification_prompt,
+                )
+                message = "조회에 필요한 조건이 하나 더 있습니다. " + message
+            elif pending and status not in {"ERROR", "FAILED", "REQUIRES_CLARIFICATION"}:
+                projection.complete_pending_clarification(
+                    session_id=session_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                )
             if projection.config.enabled:
                 projection.project(
                     request_id=response_request_id,
                     agent_request_id=agent_request_id,
-                    tenant_id=identity.tenant_id or "default",
-                    user_id=identity.user_id or "anonymous",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
                     request_text=body.message,
                     response=result,
                     intent=intent.value,
@@ -390,11 +501,11 @@ async def assistant_message(
                     extra={"event": "projection.saved", "request_id": response_request_id},
                 )
         elif intent in {BusinessIntent.RAG_QA, BusinessIntent.POLICY_INQUIRY}:
-            status, message = "NOT_SUPPORTED", "현재 Gateway는 판매 데이터 조회 요청만 지원합니다."
+            status, message = "NOT_SUPPORTED", "현재 TV Sales에서 처리할 수 없는 요청입니다."
         elif intent is BusinessIntent.CHAT:
-            status, message = "NOT_SUPPORTED", "현재 Gateway는 판매 데이터 조회 요청만 지원합니다."
+            status, message = "NOT_SUPPORTED", "현재 TV Sales에서 처리할 수 없는 요청입니다."
         elif intent is BusinessIntent.ARTIFACT_ACTION:
-            status, message = "NOT_SUPPORTED", "현재 Gateway는 판매 데이터 조회 요청만 지원합니다."
+            status, message = "NOT_SUPPORTED", "현재 TV Sales에서 처리할 수 없는 요청입니다."
         elif intent is BusinessIntent.SALES_INSIGHT:
             status, message = "NOT_IMPLEMENTED", "판매 인사이트 통합 경로는 준비 중입니다."
         elif intent is BusinessIntent.CRM_INTELLIGENCE:
@@ -402,7 +513,12 @@ async def assistant_message(
         else:
             status, message = "UNKNOWN", "요청 의도를 확인하지 못했습니다. 요청을 조금 더 구체적으로 입력해 주세요."
     except SalesAgentError as exc:
-        status, message = "ERROR", str(exc)
+        status = "ERROR"
+        message = (
+            f"요청 조건은 확인됐지만 데이터 조회 중 오류가 발생했습니다. 요청번호: {pending.get('requestId')}"
+            if pending
+            else str(exc)
+        )
         protocol_codes = {"UPSTREAM_PROTOCOL_ERROR", "INVALID_AGENT_RESPONSE"}
         data = {"errorCode": exc.code, "errorCategory": "UPSTREAM_PROTOCOL_ERROR" if exc.code in protocol_codes else "INTEGRATION_ERROR"}
         actions = [AssistantAction(type="safe_error", payload={"errorCode": exc.code})]
@@ -418,7 +534,7 @@ async def assistant_message(
             "session_id": session_id,
             "intent": intent.value,
             "route": intent.value,
-            "upstream_service": "tv-sales-agent" if intent is BusinessIntent.SALES_DATA_REQUEST else None,
+            "upstream_service": "tv-sales-agent" if is_tv_sales_intent(intent) else None,
             "status": status,
             "issue_codes": [str(item.get("code") or "") for item in issues],
             "semantic_version": (
@@ -440,6 +556,14 @@ async def assistant_message(
                 if isinstance(data.get("semantic"), dict) else None
             ),
             "agent_status": status,
+            "domain": "TV_SALES",
+            "original_message": "[REDACTED]",
+            "current_message": "[REDACTED]",
+            "pending_request_id": pending.get("requestId") if pending else None,
+            "clarification_field": pending_answer.get("field") if pending_answer else None,
+            "clarification_value": pending_answer.get("value") if pending_answer else None,
+            "query_spec_before_fields": sorted(query_spec_before),
+            "query_spec_after_fields": sorted(query_spec_after),
             "row_count": (
                 data.get("result", {}).get("rowCount")
                 if isinstance(data.get("result"), dict) else None
@@ -465,6 +589,7 @@ async def assistant_message(
         data=data,
         issues=issues,
         actions=actions,
+        clarification=clarification_prompt if status == "REQUIRES_CLARIFICATION" else None,
     )
 
 

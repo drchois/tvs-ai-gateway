@@ -4,6 +4,7 @@ import json
 import os
 import re
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
@@ -21,6 +22,7 @@ from app.services.agent_response_adapter import (
     normalize_agent_response,
 )
 from app.services.assistant_intent_router import classify_business_intent
+from app.services.clarification_service import resolve_relative_period
 from app.services.sales_agent_service import (
     HttpSalesAgentClient,
     SalesAgentError,
@@ -42,7 +44,7 @@ class IntentRouterTests(unittest.TestCase):
         self.assertEqual(classify_business_intent("매뉴얼 문서를 찾아줘", AssistantContext()), BusinessIntent.RAG_QA)
 
     def test_sales_data_routing(self) -> None:
-        self.assertEqual(classify_business_intent("지난달 구매 고객을 알려줘", AssistantContext()), BusinessIntent.SALES_DATA_REQUEST)
+        self.assertEqual(classify_business_intent("지난달 구매 고객을 알려줘", AssistantContext()), BusinessIntent.CUSTOMER_DATA_REQUEST)
 
     def test_korean_product_customer_request_routing(self) -> None:
         self.assertEqual(
@@ -50,7 +52,7 @@ class IntentRouterTests(unittest.TestCase):
                 "2026년 6월 1일부터 7월 31일까지 B.A크림50ML를 구매한 고객을 조회해줘",
                 AssistantContext(),
             ),
-            BusinessIntent.SALES_DATA_REQUEST,
+            BusinessIntent.CUSTOMER_DATA_REQUEST,
         )
 
     def test_sales_status_request_intent(self) -> None:
@@ -65,7 +67,7 @@ class IntentRouterTests(unittest.TestCase):
     def test_product_sales_request_intent(self) -> None:
         self.assertEqual(
             classify_business_intent("지난달 상품별 판매순위를 알려줘", AssistantContext()),
-            BusinessIntent.SALES_DATA_REQUEST,
+            BusinessIntent.PRODUCT_DATA_REQUEST,
         )
 
     def test_customer_purchase_request_intent(self) -> None:
@@ -74,25 +76,25 @@ class IntentRouterTests(unittest.TestCase):
                 "2026년 7월 1일부터 7월 31일까지 B.A크림50ML를 구매한 고객을 조회해줘",
                 AssistantContext(),
             ),
-            BusinessIntent.SALES_DATA_REQUEST,
+            BusinessIntent.CUSTOMER_DATA_REQUEST,
         )
 
     def test_employee_sales_request_intent(self) -> None:
         self.assertEqual(
             classify_business_intent("직원별 매출현황 보여줘", AssistantContext()),
-            BusinessIntent.SALES_DATA_REQUEST,
+            BusinessIntent.EMPLOYEE_DATA_REQUEST,
         )
 
     def test_store_sales_request_intent(self) -> None:
         self.assertEqual(
             classify_business_intent("매장별 실적을 비교해줘", AssistantContext()),
-            BusinessIntent.SALES_DATA_REQUEST,
+            BusinessIntent.STORE_DATA_REQUEST,
         )
 
     def test_sales_excel_routing_precedes_artifact(self) -> None:
         self.assertEqual(
             classify_business_intent("고객 리스트 Excel 만들어줘", AssistantContext()),
-            BusinessIntent.SALES_DATA_REQUEST,
+            BusinessIntent.CUSTOMER_DATA_REQUEST,
         )
 
     def test_sales_excel_request_routes_to_sales_agent(self) -> None:
@@ -101,7 +103,7 @@ class IntentRouterTests(unittest.TestCase):
                 "지난달 구매 고객을 조회해서 엑셀로 만들어줘",
                 AssistantContext(),
             ),
-            BusinessIntent.SALES_DATA_REQUEST,
+            BusinessIntent.CUSTOMER_DATA_REQUEST,
         )
 
     def test_general_tell_me_request_remains_chat(self) -> None:
@@ -112,6 +114,24 @@ class IntentRouterTests(unittest.TestCase):
 
     def test_unknown_fallback(self) -> None:
         self.assertEqual(classify_business_intent("12345", AssistantContext()), BusinessIntent.UNKNOWN)
+
+
+class ClarificationServiceTests(unittest.TestCase):
+    def test_relative_periods_are_normalized_in_seoul_business_time(self) -> None:
+        now = datetime(2026, 9, 24, 3, 0, tzinfo=timezone.utc)
+        expected = {
+            "오늘": "TODAY",
+            "어제": "YESTERDAY",
+            "이번주": "THIS_WEEK",
+            "지난주": "LAST_WEEK",
+            "이번달": "THIS_MONTH",
+            "지난달": "LAST_MONTH",
+            "올해": "THIS_YEAR",
+            "최근 7일": "LAST_N_DAYS",
+        }
+        for message, reference in expected.items():
+            with self.subTest(message=message):
+                self.assertEqual(resolve_relative_period(message, now=now)["reference"], reference)
 
 
 class AgentResponseAdapterTests(unittest.TestCase):
@@ -388,6 +408,40 @@ class RequestProjectionTests(unittest.TestCase):
 
     def fixture(self, name: str) -> dict:
         return json.loads((self.fixtures / name).read_text(encoding="utf-8"))
+
+    def test_pending_clarification_survives_service_restart(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_url = f"sqlite:///{Path(directory) / 'projection.db'}"
+            first = RequestProjectionService(RequestProjectionConfig(database_url=database_url))
+            first.save_pending_clarification(
+                request_id="REQ-PENDING-1",
+                session_id="session-1",
+                tenant_id="tenant-a",
+                user_id="user-a",
+                original_message="오늘 신규 고객을 조회해",
+                intent="CUSTOMER_DATA_REQUEST",
+                query_spec={"periods": {"analysis": {"reference": "TODAY"}}},
+                clarification={
+                    "field": "newCustomerType",
+                    "type": "SINGLE_SELECT",
+                    "options": [{"label": "회원 신규 가입 고객", "value": "MEMBER_SIGNUP"}],
+                },
+            )
+            first.engine.dispose()
+
+            restarted = RequestProjectionService(RequestProjectionConfig(database_url=database_url))
+            pending = restarted.find_pending_clarification(
+                session_id="session-1", tenant_id="tenant-a", user_id="user-a"
+            )
+            self.assertEqual(pending["requestId"], "REQ-PENDING-1")
+            self.assertEqual(pending["querySpec"]["periods"]["analysis"]["reference"], "TODAY")
+            restarted.complete_pending_clarification(
+                session_id="session-1", tenant_id="tenant-a", user_id="user-a"
+            )
+            self.assertIsNone(restarted.find_pending_clarification(
+                session_id="session-1", tenant_id="tenant-a", user_id="user-a"
+            ))
+            restarted.engine.dispose()
 
     def test_v21_semantic_result_projection_is_preserved(self) -> None:
         with TemporaryDirectory() as directory:
@@ -688,7 +742,7 @@ class RequestProjectionEndpointTests(unittest.TestCase):
                 detail = service.get_owned(
                     "REQ-STAGED", "header-tenant", "header-user", []
                 )
-                self.assertEqual(detail["intent"], "SALES_DATA_REQUEST")
+                self.assertEqual(detail["intent"], "PRODUCT_DATA_REQUEST")
                 self.assertEqual(detail["status"], "COMPLETED")
                 self.assertEqual(
                     [event["status"] for event in detail["events"]],
@@ -1370,7 +1424,7 @@ class MockSalesAgentIntegrationTests(unittest.TestCase):
                     json={"message": "지난달 구매 고객을 알려줘"},
                 )
                 self.assertEqual(bearer_response.status_code, 200)
-                self.assertEqual(bearer_response.json()["intent"], "SALES_DATA_REQUEST")
+                self.assertEqual(bearer_response.json()["intent"], "CUSTOMER_DATA_REQUEST")
 
                 expected = {
                     "REQUIRES_CLARIFICATION": "clarification",
@@ -1444,6 +1498,159 @@ class MockSalesAgentIntegrationTests(unittest.TestCase):
         finally:
             get_settings.cache_clear()
             app.dependency_overrides.clear()
+
+
+class PendingClarificationE2ETests(unittest.TestCase):
+    class MockClient:
+        def __init__(self) -> None:
+            self.submitted_messages: list[str] = []
+            self.executed_request_ids: list[str] = []
+            self.sequence = 0
+
+        async def submit_request(self, request, *, request_id: str, session_id: str):
+            self.sequence += 1
+            message = request.message
+            self.submitted_messages.append(message)
+            if "추가 조건:" in message:
+                return {
+                    "requestId": f"REQ-READY-{self.sequence}",
+                    "status": "READY",
+                    "message": "조회 준비가 완료되었습니다.",
+                }
+            if "신규 고객" in message or "신규고객" in message:
+                return {
+                    "requestId": f"REQ-CUSTOMER-{self.sequence}",
+                    "status": "REQUIRES_CLARIFICATION",
+                    "message": "신규고객 기준을 선택해주세요.",
+                    "questions": [{
+                        "questionId": "new-customer-definition",
+                        "field": "newCustomerType",
+                        "type": "SINGLE_SELECT",
+                        "message": "신규고객 기준을 선택해주세요.",
+                        "options": [
+                            {"label": "회원 신규 가입 고객", "value": "MEMBER_SIGNUP"},
+                            {"label": "전체 최초 구매 고객", "value": "FIRST_PURCHASE"},
+                        ],
+                    }],
+                }
+            if "B.A크림" in message:
+                return {
+                    "requestId": f"REQ-PRODUCT-{self.sequence}",
+                    "status": "REQUIRES_CLARIFICATION",
+                    "message": "조회 기간을 선택해주세요.",
+                    "questions": [{
+                        "questionId": "analysis-period",
+                        "field": "period",
+                        "type": "SINGLE_SELECT",
+                        "options": [{"label": "오늘", "value": "TODAY"}],
+                    }],
+                }
+            return self._completed(f"REQ-DIRECT-{self.sequence}")
+
+        async def execute_request(self, *, agent_request_id: str, request_id: str):
+            self.executed_request_ids.append(agent_request_id)
+            return self._completed(agent_request_id)
+
+        @staticmethod
+        def _completed(request_id: str):
+            return {
+                "requestId": request_id,
+                "status": "COMPLETED",
+                "message": "처리가 완료되었습니다.",
+                "result": {"rowCount": 1, "columns": [], "rows": [{"count": 1}]},
+            }
+
+    def setUp(self) -> None:
+        from app.core.config import get_settings
+        from app.main import app
+        from app.services.request_projection_service import get_request_projection_service
+        from app.services.sales_agent_service import get_sales_agent_client
+
+        self.temp_directory = TemporaryDirectory()
+        self.service = RequestProjectionService(RequestProjectionConfig(
+            database_url=f"sqlite:///{Path(self.temp_directory.name) / 'projection.db'}",
+        ))
+        self.mock = self.MockClient()
+        self.env_patch = patch.dict(os.environ, {"FASTAPI_API_KEY": "test-fastapi-key"})
+        self.env_patch.start()
+        get_settings.cache_clear()
+        app.dependency_overrides[get_request_projection_service] = lambda: self.service
+        app.dependency_overrides[get_sales_agent_client] = lambda: self.mock
+        self.app = app
+        self.get_settings = get_settings
+        self.client = TestClient(app)
+        self.headers = {
+            "X-API-Key": "test-fastapi-key",
+            "X-Tenant-Id": "tenant-a",
+            "X-User-Id": "user-a",
+        }
+
+    def tearDown(self) -> None:
+        self.app.dependency_overrides.clear()
+        self.get_settings.cache_clear()
+        self.env_patch.stop()
+        self.service.engine.dispose()
+        self.temp_directory.cleanup()
+
+    def post(self, session_id: str, message: str, clarification: dict | None = None):
+        body = {"sessionId": session_id, "message": message}
+        if clarification:
+            body["clarification"] = clarification
+        return self.client.post("/api/assistant/message", headers=self.headers, json=body)
+
+    def test_01_member_signup_answer_restores_pending_and_executes(self) -> None:
+        first = self.post("session-member", "오늘 신규 고객을 조회해")
+        self.assertEqual(first.json()["status"], "REQUIRES_CLARIFICATION")
+        self.assertEqual(first.json()["intent"], "CUSTOMER_DATA_REQUEST")
+        self.assertEqual(first.json()["clarification"]["field"], "newCustomerType")
+
+        second = self.post("session-member", "회원 신규 가입 고객")
+        self.assertEqual(second.json()["status"], "COMPLETED")
+        self.assertIn("오늘 신규 고객을 조회해", self.mock.submitted_messages[-1])
+        self.assertIn("newCustomerType=MEMBER_SIGNUP", self.mock.submitted_messages[-1])
+        self.assertEqual(len(self.mock.executed_request_ids), 1)
+
+    def test_02_first_purchase_natural_answer_is_mapped(self) -> None:
+        self.post("session-first-purchase", "오늘 신규 고객을 조회해")
+        response = self.post("session-first-purchase", "전체 최초 구매 고객")
+
+        self.assertEqual(response.json()["status"], "COMPLETED")
+        self.assertIn("newCustomerType=FIRST_PURCHASE", self.mock.submitted_messages[-1])
+
+    def test_03_product_context_is_kept_when_period_is_answered(self) -> None:
+        first = self.post("session-product", "B.A크림 판매데이터")
+        self.assertEqual(first.json()["status"], "REQUIRES_CLARIFICATION")
+        response = self.post("session-product", "오늘")
+
+        self.assertEqual(response.json()["status"], "COMPLETED")
+        self.assertIn("B.A크림 판매데이터", self.mock.submitted_messages[-1])
+        self.assertIn("period=TODAY", self.mock.submitted_messages[-1])
+
+    def test_04_this_month_period_survives_customer_clarification(self) -> None:
+        self.post("session-month", "이번달 신규 고객")
+        pending = self.service.find_pending_clarification(
+            session_id="session-month", tenant_id="tenant-a", user_id="user-a"
+        )
+        self.assertEqual(
+            pending["querySpec"]["periods"]["analysis"]["reference"],
+            "THIS_MONTH",
+        )
+        response = self.post(
+            "session-month",
+            "회원 신규 가입 고객",
+            {"field": "newCustomerType", "value": "MEMBER_SIGNUP"},
+        )
+        self.assertEqual(response.json()["status"], "COMPLETED")
+        self.assertIn("이번달 신규 고객", self.mock.submitted_messages[-1])
+
+    def test_05_completed_pending_is_not_applied_to_next_request(self) -> None:
+        self.post("session-reset", "오늘 신규 고객을 조회해")
+        self.post("session-reset", "회원 신규 가입 고객")
+        response = self.post("session-reset", "오늘 판매현황")
+
+        self.assertEqual(response.json()["status"], "COMPLETED")
+        self.assertEqual(self.mock.submitted_messages[-1], "오늘 판매현황")
+        self.assertNotIn("추가 조건:", self.mock.submitted_messages[-1])
 
 
 class TooManyResultsEndpointTests(unittest.TestCase):

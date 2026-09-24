@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from sqlalchemy import DateTime, Integer, String, Text, create_engine, func, inspect, or_, select, text
+from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint, create_engine, func, inspect, or_, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from app.core.config import RequestProjectionConfig, get_settings
@@ -123,6 +123,27 @@ class UserDataRequestEvent(Base):
     status: Mapped[str] = mapped_column(String(64))
     message: Mapped[str | None] = mapped_column(Text)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PendingClarificationRequest(Base):
+    __tablename__ = "pending_clarification_request"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "user_id", "session_id", name="uq_pending_clarification_session"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(128), index=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    user_id: Mapped[str] = mapped_column(String(128), index=True)
+    original_message: Mapped[str] = mapped_column(Text)
+    domain: Mapped[str] = mapped_column(String(64), default="TV_SALES")
+    intent: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(64), index=True)
+    query_spec_json: Mapped[str | None] = mapped_column(Text)
+    clarification_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 def _dump(value: Any) -> str | None:
@@ -290,6 +311,93 @@ class RequestProjectionService:
                     occurred_at=now,
                 ))
             session.commit()
+
+    def save_pending_clarification(
+        self,
+        *,
+        request_id: str,
+        session_id: str,
+        tenant_id: str,
+        user_id: str,
+        original_message: str,
+        intent: str,
+        query_spec: dict[str, Any],
+        clarification: dict[str, Any],
+    ) -> None:
+        now = _now()
+        with Session(self.engine) as session:
+            item = session.scalar(
+                select(PendingClarificationRequest).where(
+                    PendingClarificationRequest.tenant_id == tenant_id,
+                    PendingClarificationRequest.user_id == user_id,
+                    PendingClarificationRequest.session_id == session_id,
+                )
+            )
+            if item is None:
+                item = PendingClarificationRequest(
+                    request_id=request_id,
+                    session_id=session_id,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    original_message=original_message,
+                    domain="TV_SALES",
+                    intent=intent,
+                    status="REQUIRES_CLARIFICATION",
+                    clarification_json=_dump(clarification) or "{}",
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(item)
+            item.request_id = request_id
+            item.original_message = original_message
+            item.intent = intent
+            item.status = "REQUIRES_CLARIFICATION"
+            item.query_spec_json = _dump(query_spec)
+            item.clarification_json = _dump(clarification) or "{}"
+            item.updated_at = now
+            session.commit()
+
+    def find_pending_clarification(
+        self, *, session_id: str, tenant_id: str, user_id: str
+    ) -> dict[str, Any] | None:
+        with Session(self.engine) as session:
+            item = session.scalar(
+                select(PendingClarificationRequest).where(
+                    PendingClarificationRequest.tenant_id == tenant_id,
+                    PendingClarificationRequest.user_id == user_id,
+                    PendingClarificationRequest.session_id == session_id,
+                    PendingClarificationRequest.status == "REQUIRES_CLARIFICATION",
+                )
+            )
+            if item is None:
+                return None
+            return {
+                "requestId": item.request_id,
+                "sessionId": item.session_id,
+                "originalMessage": item.original_message,
+                "domain": item.domain,
+                "intent": item.intent,
+                "status": item.status,
+                "querySpec": _load(item.query_spec_json, {}),
+                "clarification": _load(item.clarification_json, {}),
+            }
+
+    def complete_pending_clarification(
+        self, *, session_id: str, tenant_id: str, user_id: str
+    ) -> None:
+        with Session(self.engine) as session:
+            item = session.scalar(
+                select(PendingClarificationRequest).where(
+                    PendingClarificationRequest.tenant_id == tenant_id,
+                    PendingClarificationRequest.user_id == user_id,
+                    PendingClarificationRequest.session_id == session_id,
+                    PendingClarificationRequest.status == "REQUIRES_CLARIFICATION",
+                )
+            )
+            if item is not None:
+                item.status = "COMPLETED"
+                item.updated_at = _now()
+                session.commit()
 
     @staticmethod
     def _upsert_artifact(

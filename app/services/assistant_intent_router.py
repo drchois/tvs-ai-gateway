@@ -34,6 +34,7 @@ _SALES_DOMAIN_TERMS = (
 )
 
 _DATA_REQUEST_TERMS = (
+    "데이터",
     "조회",
     "현황",
     "보여줘",
@@ -47,6 +48,19 @@ _DATA_REQUEST_TERMS = (
     # A domain term must also be present, so a general "알려줘" remains chat.
     "알려줘",
 )
+
+
+TV_SALES_INTENTS = {
+    BusinessIntent.SALES_DATA_REQUEST,
+    BusinessIntent.CUSTOMER_DATA_REQUEST,
+    BusinessIntent.PRODUCT_DATA_REQUEST,
+    BusinessIntent.STORE_DATA_REQUEST,
+    BusinessIntent.EMPLOYEE_DATA_REQUEST,
+}
+
+
+def is_tv_sales_intent(intent: BusinessIntent) -> bool:
+    return intent in TV_SALES_INTENTS
 
 
 def classify_business_intent(message: str, context: AssistantContext) -> BusinessIntent:
@@ -63,7 +77,18 @@ def classify_business_intent(message: str, context: AssistantContext) -> Busines
         return BusinessIntent.RAG_QA
     has_sales_domain = any(term in text for term in _SALES_DOMAIN_TERMS)
     has_data_request = any(term in text for term in _DATA_REQUEST_TERMS)
-    if has_sales_domain and (has_data_request or "sales" in menu):
+    has_relative_period = any(
+        term in text for term in ("오늘", "어제", "이번주", "지난주", "이번달", "지난달", "올해", "최근")
+    )
+    if has_sales_domain and (has_data_request or has_relative_period or "sales" in menu):
+        if any(term in text for term in ("고객", "신규고객", "구매고객")):
+            return BusinessIntent.CUSTOMER_DATA_REQUEST
+        if any(term in text for term in ("직원", "사원")):
+            return BusinessIntent.EMPLOYEE_DATA_REQUEST
+        if "매장" in text:
+            return BusinessIntent.STORE_DATA_REQUEST
+        if any(term in text for term in ("상품", "제품")):
+            return BusinessIntent.PRODUCT_DATA_REQUEST
         return BusinessIntent.SALES_DATA_REQUEST
     if any(word in text for word in ("ppt", "엑셀", "excel", "pdf", "다운로드", "파일로")):
         return BusinessIntent.ARTIFACT_ACTION

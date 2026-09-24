@@ -16,8 +16,18 @@ services:
     env_file:
       - .env
 
+    # tv-sales-agent runs as a Java process on the Docker host.
+    # This mapping also makes host.docker.internal available on Linux Docker.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     environment:
       TZ: Asia/Seoul
+
+    # Persist request projections and pending clarification context across
+    # container replacement during production deployments.
+    volumes:
+      - tvs-ai-gateway-data:/app/data
 
     healthcheck:
       test:
@@ -31,3 +41,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+volumes:
+  tvs-ai-gateway-data:
